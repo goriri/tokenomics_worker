@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "tokenomics-worker-tools": {
+      "command": "python3",
+      "args": [
+        "mcp/tokenomics_tools_server.py"
+      ],
+      "description": "Tokenomics Worker tools: active model config and pairing verdict, quota and cache status for the configured models, test tampering detection, and a local usage ledger."
+    }
+  }
+}

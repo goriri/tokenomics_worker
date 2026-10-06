@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.tmp
+# Local model choices and learned enums; never commit.
+tokenomics.config.json
+.DS_Store

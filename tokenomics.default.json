@@ -1,0 +1,11 @@
+{
+  "$comment": "Shipped defaults. Your own choices are saved to tokenomics.config.json (gitignored) by the set_models and learn_model MCP tools. 'orchestrator' only drives the cost math: the orchestrator runs on whatever model you pick in the IDE. role_overrides pins one role to a different model; null means 'use subagent'. custom_models holds models taught with learn_model: {\"my-model\": {\"enum\": \"MODEL_...\", \"label\": \"...\", \"billing\": {\"unit\": \"tokens|calls|unknown\", \"bucket\": \"...\", \"daily_limit\": 0}}} or \"billing_like\": \"<known id>\".",
+  "orchestrator": "opus-5.5-high",
+  "subagent": "gemini-3.8-flash-high",
+  "role_overrides": {
+    "scout": null,
+    "worker": null,
+    "redteam": null
+  },
+  "custom_models": {}
+}

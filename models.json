@@ -1,0 +1,47 @@
+{
+  "$comment": "Optional shared names and labels. Enums are deliberately not shipped: they are learned from your own IDE with the learn_model tool and saved to tokenomics.config.json. Add a 'billing' block ({\"unit\": \"tokens|calls|unknown\", \"bucket\": \"...\", \"daily_limit\": N, \"token_weights\": {...}, \"cache_ttl_seconds\": N}) here or via learn_model if you know a model's quota.",
+  "models": {
+    "opus-5-high": {
+      "label": "Claude Opus 5, high thinking",
+      "billing": {
+        "unit": "unknown"
+      }
+    },
+    "opus-5.5-high": {
+      "label": "Claude Opus 5.5, high thinking",
+      "billing": {
+        "unit": "unknown"
+      }
+    },
+    "gemini-3.8-flash-high": {
+      "label": "Gemini 3.8 Flash, high thinking",
+      "billing": {
+        "unit": "unknown"
+      }
+    },
+    "gemini-3.8-flash-medium": {
+      "label": "Gemini 3.8 Flash, medium thinking",
+      "billing": {
+        "unit": "unknown"
+      }
+    },
+    "gemini-3.8-flash-low": {
+      "label": "Gemini 3.8 Flash, low thinking",
+      "billing": {
+        "unit": "unknown"
+      }
+    },
+    "gemini-3.1-pro-high": {
+      "label": "Gemini 3.1 Pro, high thinking",
+      "billing": {
+        "unit": "unknown"
+      }
+    },
+    "gemini-3.1-pro-low": {
+      "label": "Gemini 3.1 Pro, low thinking",
+      "billing": {
+        "unit": "unknown"
+      }
+    }
+  }
+}

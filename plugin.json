@@ -1,0 +1,11 @@
+{
+  "name": "tokenomics-worker",
+  "displayName": "Tokenomics Worker",
+  "version": "1.0.0",
+  "description": "Opt-in orchestrator/worker skill (/tokenomics-worker) where you choose the orchestrator model (the IDE's model picker) and the subagent models (from chat). Ships an orchestrator main agent, three pinnable subagents (scout, implementer, single-turn reviewer-fixer), and an MCP server that pins them per conversation or as defaults, learns model enums from your own conversations, and judges whether the pairing actually saves quota.",
+  "suggestedPrompts": [
+    "/tokenomics-worker subagent=gemini-3.8-flash-high: fan out scouts to find every caller of this symbol.",
+    "Show my tokenomics-worker model configuration and whether the pairing saves quota.",
+    "learn_model gemini-3.8-flash-high from conversation <id>, billing unit calls"
+  ]
+}
