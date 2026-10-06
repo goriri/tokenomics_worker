@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import shutil
 from typing import Any
 
 import tokenomics_config as tc
@@ -61,12 +62,23 @@ def _load_template(role: str) -> dict[str, Any]:
     return json.load(f)
 
 
-def subagent_table(roles: dict[str, Any], names: dict[str, str]) -> str:
-  return "\n".join(
-      f"   - {names[r]}: {ROLE_BLURBS[r]} -> {roles[r]['label']}"
-      f" ({roles[r]['model_id']})"
-      for r in tc.SUBAGENT_ROLES
-  )
+def subagent_table(
+    roles: dict[str, Any],
+    names: dict[str, str],
+    fallback_names: dict[str, str] | None = None,
+) -> str:
+  lines = []
+  for r in tc.SUBAGENT_ROLES:
+    line = (
+        f"   - {names[r]}: {ROLE_BLURBS[r]} -> {roles[r]['label']}"
+        f" ({roles[r]['model_id']})"
+    )
+    fb = roles[r].get("fallback")
+    if fb:
+      fb_name = (fallback_names or {}).get(r) or f"{names[r]}_fallback"
+      line += f" | fallback: {fb_name} -> {fb['label']} ({fb['model_id']})"
+    lines.append(line)
+  return "\n".join(lines)
 
 
 def findings_text(economics: dict[str, Any], indent: str = "   ") -> str:
@@ -77,18 +89,31 @@ def findings_text(economics: dict[str, Any], indent: str = "   ") -> str:
 
 
 def render_agent(
-    role: str, active: dict[str, Any], names: dict[str, str]
+    role: str,
+    active: dict[str, Any],
+    names: dict[str, str],
+    is_fallback: bool = False,
+    fallback_names: dict[str, str] | None = None,
 ) -> dict[str, Any]:
   """Renders one agent.json from its template and the active config."""
-  info = active["roles"][role]
+  info = (
+      active["roles"][role]["fallback"]
+      if is_fallback
+      else active["roles"][role]
+  )
   economics = active["economics"]
+  agent_name = (
+      (fallback_names or {}).get(role, f"{names[role]}_fallback")
+      if is_fallback
+      else names[role]
+  )
   values = {
-      "AGENT_NAME": names[role],
+      "AGENT_NAME": agent_name,
       "MODEL_ID": info["model_id"],
       "MODEL_LABEL": info["label"],
       "ENUM": info["enum"] or "",
       "PLUGIN_DIR": tc.plugin_dir_for_prompts(),
-      "SUBAGENT_TABLE": subagent_table(active["roles"], names),
+      "SUBAGENT_TABLE": subagent_table(active["roles"], names, fallback_names),
       "ORCH_DOCTRINE": economics["orchestrator"]["summary"],
       "MODE": economics["mode"],
       "FINDINGS": findings_text(economics),
@@ -99,9 +124,10 @@ def render_agent(
     # which would silently pin it to the IDE's default model.
     rendered.pop("disable_model_selection", None)
     rendered.get("config", {}).pop("cascade_config", None)
-    rendered["description"] = rendered["description"].replace(
-        " pinned to ", " intended for "
-    ) + " NOT PINNED YET: run learn_model and set_models."
+    rendered["description"] = (
+        rendered["description"].replace(" pinned to ", " intended for ")
+        + " NOT PINNED YET: run learn_model and set_models."
+    )
   leftover = re.findall(r"\{\{[A-Z_]+\}\}", json.dumps(rendered))
   if leftover:
     raise tc.ConfigError(f"template {role}.json has unknown placeholders {leftover}")
@@ -134,7 +160,38 @@ def planned_writes(
   for role in tc.ALL_ROLES:
     path = os.path.join(agents_dir, tc.AGENT_NAMES[role], "agent.json")
     writes[path] = dump_json(render_agent(role, active, tc.AGENT_NAMES))
+  for role in tc.SUBAGENT_ROLES:
+    if active["roles"][role].get("fallback"):
+      fallback_agent_dir = f"{tc.AGENT_NAMES[role]}_fallback"
+      path = os.path.join(agents_dir, fallback_agent_dir, "agent.json")
+      writes[path] = dump_json(
+          render_agent(role, active, tc.AGENT_NAMES, is_fallback=True)
+      )
   return writes
+
+
+def cleanup_fallback_agents(
+    agents_dir: str | None = None, active: dict[str, Any] | None = None
+) -> list[str]:
+  """Removes agents/tw_*_fallback directories whose role no longer has a fallback."""
+  agents_dir = agents_dir or AGENTS_DIR
+  if not os.path.isdir(agents_dir):
+    return []
+  active = active or tc.load_active()
+  active_fallback_dirs = set()
+  for role in tc.SUBAGENT_ROLES:
+    if active["roles"][role].get("fallback"):
+      active_fallback_dirs.add(f"{tc.AGENT_NAMES[role]}_fallback")
+
+  removed = []
+  for entry in os.listdir(agents_dir):
+    if entry.startswith("tw_") and entry.endswith("_fallback"):
+      if entry not in active_fallback_dirs:
+        dir_path = os.path.join(agents_dir, entry)
+        if os.path.isdir(dir_path):
+          shutil.rmtree(dir_path)
+          removed.append(dir_path)
+  return removed
 
 
 def stale_files(active: dict[str, Any], **kwargs: str | None) -> list[str]:
@@ -153,9 +210,10 @@ def stale_files(active: dict[str, Any], **kwargs: str | None) -> list[str]:
 def _conv_dir(conversation_id: str, brain_root: str | None) -> str:
   if not conversation_id or not _CONV_ID_RE.fullmatch(conversation_id):
     raise tc.ConfigError(f"invalid conversation id {conversation_id!r}")
-  return os.path.join(
-      brain_root or os.path.join(tc.app_data_dir(), "brain"), conversation_id
-  )
+  if brain_root is None:
+    app_dir = tc.find_app_dir_for_conversation(conversation_id) or tc.app_data_dir()
+    brain_root = os.path.join(app_dir, "brain")
+  return os.path.join(brain_root, conversation_id)
 
 
 def install_session(
@@ -165,27 +223,76 @@ def install_session(
   unpinned = [r for r in tc.SUBAGENT_ROLES if not active["roles"][r].get("enum")]
   if unpinned:
     raise tc.ConfigError(f"no enum known for roles {unpinned}; run learn_model")
+
+  for role in tc.SUBAGENT_ROLES:
+    fb = active["roles"][role].get("fallback")
+    if fb and not fb.get("enum"):
+      raise tc.ConfigError(
+          f"no enum known for fallback role {role} ({fb['model_id']}); run learn_model"
+      )
+
   conv_dir = _conv_dir(conversation_id, brain_root)
   agents_root = os.path.join(conv_dir, ".agents", "agents")
   names = dict(tc.AGENT_NAMES)
+  fallback_names: dict[str, str] = {}
   for role in tc.SUBAGENT_ROLES:
     names[role] = ephemeral_agent_name(role, active["roles"][role]["model_id"])
+    fb = active["roles"][role].get("fallback")
+    if fb:
+      fallback_names[role] = ephemeral_agent_name(role, fb["model_id"])
+
   for role in tc.SUBAGENT_ROLES:
     write_file(
         os.path.join(agents_root, names[role], "agent.json"),
-        dump_json(render_agent(role, active, names)),
+        dump_json(
+            render_agent(
+                role,
+                active,
+                names,
+                is_fallback=False,
+                fallback_names=fallback_names,
+            )
+        ),
     )
+    if role in fallback_names:
+      write_file(
+          os.path.join(agents_root, fallback_names[role], "agent.json"),
+          dump_json(
+              render_agent(
+                  role,
+                  active,
+                  names,
+                  is_fallback=True,
+                  fallback_names=fallback_names,
+              )
+          ),
+      )
+
+  orch_fb = active["roles"]["orchestrator"].get("fallback")
+  orch_fb_id = orch_fb["model_id"] if orch_fb else None
+
+  subagent_manifest = {}
+  for role in tc.SUBAGENT_ROLES:
+    sub_dict: dict[str, Any] = {
+        "type_name": names[role],
+        "model_id": active["roles"][role]["model_id"],
+        "enum": active["roles"][role]["enum"],
+    }
+    if role in fallback_names:
+      sub_dict["fallback"] = {
+          "type_name": fallback_names[role],
+          "model_id": active["roles"][role]["fallback"]["model_id"],
+          "enum": active["roles"][role]["fallback"]["enum"],
+      }
+    else:
+      sub_dict["fallback"] = None
+    subagent_manifest[role] = sub_dict
+
   manifest = {
       "conversation_id": conversation_id,
       "orchestrator": active["roles"]["orchestrator"]["model_id"],
-      "subagents": {
-          role: {
-              "type_name": names[role],
-              "model_id": active["roles"][role]["model_id"],
-              "enum": active["roles"][role]["enum"],
-          }
-          for role in tc.SUBAGENT_ROLES
-      },
+      "orchestrator_fallback": orch_fb_id,
+      "subagents": subagent_manifest,
       "pairing_verdict": active["economics"]["mode"],
       "findings": active["economics"]["findings"],
   }

@@ -6,9 +6,11 @@ description: >-
   tw_orchestrator main agent. Runs a configurable orchestrator model that
   delegates token-heavy execution to pinned subagents (tw_scout, tw_worker,
   tw_redteam) on a configurable subagent model, so the expensive budget is
-  spent on judgment rather than bulk volume. Accepts orchestrator=<model_id>
-  and subagent=<model_id> arguments. Do NOT auto-activate on general coding
-  tasks.
+  spent on judgment rather than bulk volume. "/tokenomics-worker models" opens
+  an interactive model picker; also accepts subagent=, <role>=, fallback=,
+  <role>_fallback=, orchestrator_fallback= and persist arguments, with model
+  ids or labels from the CLI's /model list. Do NOT auto-activate on general
+  coding tasks.
 metadata:
   icon: 🪙
 ---
@@ -24,33 +26,41 @@ A conductor/worker pattern with both halves configurable. The **orchestrator**
 keeps the wheel and spends its tokens on decomposition, arbitration, and
 judgment. Pinned **subagents** absorb the reading, typing, and waiting.
 
-Everything is chosen inside the IDE; there is no script to run:
+Everything is chosen from chat, with the same model names the CLI's `/model`
+list shows:
 
--   **Orchestrator model:** whatever the user picks in the IDE's model picker.
-    `tw_orchestrator` is deliberately not pinned.
--   **Subagent models:** set from chat through the `tokenomics-worker-tools`
-    MCP server (`set_models`, `learn_model`, `get_model_config`,
-    `list_models`). Plugin defaults live in `tokenomics.config.json` (falling
-    back to the shipped `tokenomics.default.json`) and are rendered into the
-    `tw_*` agents.
+-   **Orchestrator model:** whatever the user picks with `/model` (or the IDE's
+    model picker). `tw_orchestrator` is deliberately not pinned; the plugin
+    detects your live model for the cost math.
+-   **Subagent models and fallbacks:** set through the `tokenomics-worker-tools`
+    MCP server. Plugin defaults live in `tokenomics.config.json` (falling back
+    to the shipped `tokenomics.default.json`) and are rendered into the `tw_*`
+    agents.
 
 Paths below use `{plugin}` for the plugin root (the folder holding this
 plugin's `plugin.json`).
 
 ## Step 0: confirm the configuration before delegating
 
-1.  **Call `get_model_config`** with your conversation id. It returns the
-    plugin defaults (per role: model id, label, whether it is pinned, enum,
-    billing), the pairing verdict with its findings, the orchestrator cost
-    rules, and any session pins for this conversation. Session pins win over
-    the defaults.
-2.  **Check your own model.** Call `get_model_config` with your conversation
-    id: `live_model` is the enum that actually served your last turn. If it is
-    not the orchestrator the verdict was computed for, say so in one line and
-    re-run `set_models` with `orchestrator=<the id the user picked>` so the cost
-    math matches. A live conversation's model cannot be swapped by you; the
-    user changes it in the picker.
-3.  **Act on the verdict.**
+1.  **Refresh the model catalog** (one shell command, run by you, not the
+    user):
+
+    ```bash
+    python3 {plugin}/scripts/model_catalog.py
+    ```
+
+    It reads the CLI's own model list (ids, labels, live quota and reset
+    times) and caches it for the MCP tools. It never stores credentials. Skip
+    it if `get_model_config` reports a catalog younger than 15 minutes.
+2.  **Call `get_model_config`** with your conversation id. It returns the
+    plugin defaults per role (model, pinned or not, billing, fallback), the
+    pairing verdict and findings, your cost rules, session pins, `live_model`
+    (the model that served your last turn), and `routing`: which TypeName to
+    use for each role right now.
+3.  **Check your own model.** If `live_model` is not the orchestrator the
+    verdict assumes, re-run `set_models` with `conversation_id` only; it
+    adopts your live model as the orchestrator.
+4.  **Act on the verdict.**
     -   `offload`: proceed.
     -   `partial`: proceed, but obey each `warn` line (for example, if workers
         are token-metered, keep their reads bounded and stop treating their
@@ -58,45 +68,93 @@ plugin's `plugin.json`).
     -   `counterproductive`: tell the user what the `risk` line says and
         recommend a fix before fanning out. Do not quietly run an inverted
         pairing.
-    -   A role reported as **not pinned** (a fresh install: no model enum
-        learned yet) runs on whatever model the IDE picks, usually yours. Walk
-        the user through `learn_model` (below) before delegating anything
-        token-heavy.
+    -   A role reported as **not pinned** runs on whatever model the IDE picks,
+        usually yours. Fix it with `set_models` (any model in the catalog
+        pins directly) before delegating anything token-heavy.
 
-### Arguments: choosing models from the slash command
+## Choosing models
+
+### Interactive picker: `/tokenomics-worker models`
+
+When the user types `/tokenomics-worker models` (or `model`, or asks to
+choose/switch models without naming them), give them the same experience as
+the CLI's `/model`:
+
+1.  Refresh the catalog (Step 0.1), then call `list_models`. Show its `picker`
+    table verbatim in a code block: it lists every model the CLI offers with
+    quota %, reset time, and the current selections marked.
+2.  Ask in **one** `ask_question` call (single-select each; recommended
+    models first; put quota % in each option text, e.g.
+    `Gemini 3.8 Flash (High) - 78%`):
+    -   **Subagent model** (current one first, marked "(current)").
+    -   **Subagent fallback** (first option `No fallback`).
+    -   **Orchestrator fallback** (first option `No fallback`). Note in the
+        question that the orchestrator itself is changed with `/model`.
+    -   **Apply to**: `This conversation only (Recommended)` / `Save as my
+        default`.
+3.  Call `set_models` once with the chosen **labels** (labels are accepted
+    as-is), `conversation_id`, and `persist: true` only for "Save as my
+    default". Report the resulting TypeNames, fallbacks, and verdict in a few
+    lines.
+
+If the user wants per-role models (cheap scouts, strong workers), ask a
+follow-up with one question per role instead of the single subagent question.
+
+### Arguments: `/tokenomics-worker key=value ...`
 
 ```text
-/tokenomics-worker [orchestrator=<id>] [subagent=<id>] [scout=<id>] [worker=<id>] [redteam=<id>] [persist]
+/tokenomics-worker [subagent=<model>] [scout=<model>] [worker=<model>] [redteam=<model>]
+                   [fallback=<model>] [<role>_fallback=<model>] [orchestrator_fallback=<model>]
+                   [orchestrator=<model>] [threshold=<0..1>] [persist]
 ```
 
-Map the arguments straight onto one `set_models` MCP call. Always pass
-`conversation_id` (your current conversation id).
+`<model>` is a model id, its label (`"Gemini 3.8 Flash (High)"`), or a loose
+query (`flash high`); `set_models` resolves it against the catalog and errors
+on ambiguity with the candidates, which you show to the user. Map the
+arguments onto one `set_models` call with `conversation_id`: `fallback` means
+`subagent_fallback`, `threshold` means `fallback_threshold`, `none` clears a
+value.
 
--   **No model arguments:** use the active configuration as is. No call needed.
--   **Model arguments, no `persist`:** call `set_models` with
-    `persist: false`. It installs conversation-scoped pins that load
-    immediately, without touching the config, and returns
-    `use_these_type_names`. These have **different TypeNames** (for example
-    `tw_worker_gemini_3_8_flash_medium`) so the plugin's own `tw_worker` cannot
-    shadow them. Use exactly those TypeNames for the rest of the conversation;
-    they are also recorded in `<app data dir>/brain/<id>/tokenomics.session.json`.
--   **`persist`:** call `set_models` with `persist: true`. It also saves the
-    config and re-renders the plugin's `tw_*` agents, so later conversations get
-    the new defaults after an IDE restart.
--   **`orchestrator=<id>`** never changes your model; the picker does. It tells
-    the economics check which billing to assume. Say so instead of pretending.
--   Use `dry_run: true` to preview the verdict before installing anything.
--   **Unknown id?** `list_models` with a `filter`. If the model is in the IDE's
-    picker but not in the registry, it needs an enum, which is never guessed:
-    ask the user to start a new conversation on that model, send one message,
-    and give you that conversation id. Then call `learn_model` with the
-    `model_id`, that `conversation_id`, and optionally `billing_like` (an id
-    whose billing it shares; flagged as assumed). After that it pins like any
-    other model.
+-   **No model arguments:** use the active configuration as is.
+-   **Without `persist`:** conversation-scoped pins that load immediately,
+    returned as `use_these_type_names` and `fallback_type_names` (distinct
+    TypeNames such as `tw_worker_gemini_3_8_flash_medium`, so the plugin's own
+    `tw_worker` cannot shadow them). Use exactly those names for the rest of
+    the conversation.
+-   **`persist`:** also saves the config and re-renders the plugin's `tw_*`
+    agents (fallbacks as `tw_<role>_fallback`), for new conversations after a
+    restart.
+-   **`orchestrator=<model>`** only changes the cost math; you cannot change
+    your own model. Without it, `set_models` uses your live model.
+-   `dry_run: true` previews the verdict and routing without installing.
+-   A model the CLI does not list (or no catalog available): `learn_model`
+    with a conversation that ran on it. `set_model_info` records a model's
+    label or billing (`unit` tokens/calls) without needing an enum.
 
 Installing agents changes the tool and subagent definitions in your system
 prompt, which invalidates the prompt cache. Do it once, at the start, not
 mid-task.
+
+### Fallbacks and routing
+
+Each subagent role can have a fallback model (pinned as its own TypeName),
+and the orchestrator can have one too. `routing` (from `get_model_config`,
+`set_models`, or the cheap `route_models`) says which TypeName to dispatch to:
+
+-   It switches a role to its fallback when the primary's remaining quota is
+    at or below `fallback_threshold` (default 5%), or when the primary is no
+    longer in the catalog, provided the fallback has more quota left.
+-   **Before each fan-out**, call `route_models` and dispatch to each role's
+    `use_type_name`. Refresh the catalog first if routing says
+    `stale_catalog`.
+-   **On a dispatch failure** that mentions quota, capacity, rate limits,
+    `RESOURCE_EXHAUSTED`, 429, or an unavailable model, re-send the same
+    prompt once to that role's fallback TypeName and tell the user in one
+    line. Do not retry the primary in a loop.
+-   **Orchestrator:** you cannot switch your own model. When routing for the
+    orchestrator carries an `action`, or you hit quota/capacity errors
+    yourself, tell the user to run `/model` and pick the named fallback, then
+    continue after they switch.
 
 ## Why this exists
 

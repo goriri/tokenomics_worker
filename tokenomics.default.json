@@ -7,5 +7,13 @@
     "worker": null,
     "redteam": null
   },
+  "fallbacks": {
+    "orchestrator": null,
+    "subagent": null,
+    "scout": null,
+    "worker": null,
+    "redteam": null
+  },
+  "fallback_threshold": 0.05,
   "custom_models": {}
 }

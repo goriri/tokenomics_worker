@@ -12,6 +12,7 @@ scripts/verify_and_record.py, and has no dependencies outside the stdlib.
 
 from __future__ import annotations
 
+import datetime
 import glob
 import io
 import json
@@ -45,10 +46,60 @@ APP_DIR_ENV = "TOKENOMICS_APP_DIR"
 PLUGIN_DIR_ENV = "TOKENOMICS_PLUGIN_DIR"
 DEFAULT_PLUGIN_DIR = "~/.gemini/config/plugins/tokenomics_worker"
 
+SUBAGENT_ROLES = ("scout", "worker", "redteam")
+ALL_ROLES = ("orchestrator",) + SUBAGENT_ROLES
+
+AGENT_NAMES = {
+    "orchestrator": "tw_orchestrator",
+    "scout": "tw_scout",
+    "worker": "tw_worker",
+    "redteam": "tw_redteam",
+}
+
+DEFAULT_FALLBACKS: dict[str, str | None] = {
+    "orchestrator": None,
+    "subagent": None,
+    "scout": None,
+    "worker": None,
+    "redteam": None,
+}
+DEFAULT_FALLBACK_THRESHOLD = 0.05
+
+_ENUM_RE = re.compile(r"^MODEL_[A-Za-z0-9_]+$")
+_CATALOG_SENTINEL = object()
+
+LEVEL_OK = "ok"
+LEVEL_WARN = "warn"
+LEVEL_RISK = "risk"
+
+
+class ConfigError(Exception):
+  """Raised when the configuration cannot be resolved into pinned agents."""
+
 
 def plugin_dir_for_prompts() -> str:
   """Returns the plugin path written into rendered agent prompts."""
   return os.environ.get(PLUGIN_DIR_ENV) or DEFAULT_PLUGIN_DIR
+
+
+def find_app_dir_for_conversation(conversation_id: str) -> str | None:
+  """Finds the app directory under ~/.gemini holding a conversation db or brain."""
+  override = os.environ.get(APP_DIR_ENV)
+  if override:
+    return os.path.expanduser(override)
+  clean_id = (conversation_id or "").strip()
+  if not clean_id:
+    return None
+  pattern = os.path.expanduser("~/.gemini/*/conversations")
+  for conv_dir in glob.glob(pattern):
+    base = os.path.dirname(conv_dir)
+    brain_dir = os.path.join(base, "brain")
+    if os.path.isdir(conv_dir) and os.path.isdir(brain_dir):
+      db_path = os.path.join(conv_dir, f"{clean_id}.db")
+      brain_path = os.path.join(brain_dir, clean_id)
+      if os.path.exists(db_path) or os.path.isdir(brain_path):
+        return base
+  return None
 
 
 def app_data_dir() -> str:
@@ -77,27 +128,6 @@ def app_data_dir() -> str:
       candidates,
       key=lambda d: os.path.getmtime(os.path.join(d, "conversations")),
   )
-
-
-SUBAGENT_ROLES = ("scout", "worker", "redteam")
-ALL_ROLES = ("orchestrator",) + SUBAGENT_ROLES
-
-AGENT_NAMES = {
-    "orchestrator": "tw_orchestrator",
-    "scout": "tw_scout",
-    "worker": "tw_worker",
-    "redteam": "tw_redteam",
-}
-
-_ENUM_RE = re.compile(r"^MODEL_[A-Za-z0-9_]+$")
-
-LEVEL_OK = "ok"
-LEVEL_WARN = "warn"
-LEVEL_RISK = "risk"
-
-
-class ConfigError(Exception):
-  """Raised when the configuration cannot be resolved into pinned agents."""
 
 
 def display_path(path: str) -> str:
@@ -153,6 +183,46 @@ def load_config(path: str | None = None) -> dict[str, Any]:
     clean_overrides[role] = value.strip() if value else None
   data["role_overrides"] = clean_overrides
 
+  fallbacks = data.get("fallbacks")
+  if fallbacks is None:
+    clean_fallbacks = dict(DEFAULT_FALLBACKS)
+  elif not isinstance(fallbacks, dict):
+    raise ConfigError(f"{cfg_path}: 'fallbacks' must be an object")
+  else:
+    valid_fb_keys = set(DEFAULT_FALLBACKS.keys())
+    unknown_fb = sorted(set(fallbacks) - valid_fb_keys)
+    if unknown_fb:
+      raise ConfigError(
+          f"{cfg_path}: unknown fallbacks {unknown_fb}; valid keys are"
+          f" {sorted(valid_fb_keys)}"
+      )
+    clean_fallbacks = dict(DEFAULT_FALLBACKS)
+    for k in valid_fb_keys:
+      v = fallbacks.get(k)
+      if v is not None and (not isinstance(v, str) or not v.strip()):
+        raise ConfigError(
+            f"{cfg_path}: fallbacks.{k} must be a model id or null"
+        )
+      clean_fallbacks[k] = v.strip() if v else None
+  data["fallbacks"] = clean_fallbacks
+
+  threshold = data.get("fallback_threshold")
+  if threshold is None:
+    data["fallback_threshold"] = DEFAULT_FALLBACK_THRESHOLD
+  else:
+    try:
+      val = float(threshold)
+    except (ValueError, TypeError):
+      raise ConfigError(
+          f"{cfg_path}: 'fallback_threshold' must be a number between 0 and 1,"
+          f" got {threshold!r}"
+      )
+    if not (0.0 <= val <= 1.0):
+      raise ConfigError(
+          f"{cfg_path}: 'fallback_threshold' must be between 0 and 1, got {val}"
+      )
+    data["fallback_threshold"] = val
+
   custom = data.get("custom_models") or {}
   if not isinstance(custom, dict):
     raise ConfigError(f"{cfg_path}: 'custom_models' must be an object")
@@ -188,18 +258,11 @@ def save_config(data: dict[str, Any], path: str | None = None) -> None:
 def load_registry(
     config: dict[str, Any] | None = None,
     registry_path: str | None = None,
+    catalog: Any = _CATALOG_SENTINEL,
 ) -> dict[str, dict[str, Any]]:
-  """Builds model_id -> info from models.json and custom_models.
+  """Builds model_id -> info from models.json, live catalog, and custom_models.
 
-  custom_models (written by learn_model, or by hand) wins over the bundled
-  models.json for both enum and billing.
-
-  Args:
-    config: Loaded tokenomics config, for custom_models. Optional.
-    registry_path: Bundled registry path. Defaults to <plugin>/models.json.
-
-  Returns:
-    Dict of model id to {enum, enum_source, label, billing, alias, notes}.
+  Precedence: custom_models > live catalog > models.json.
   """
   bundled = _read_json(registry_path or REGISTRY_PATH).get("models", {})
   registry: dict[str, dict[str, Any]] = {}
@@ -212,6 +275,51 @@ def load_registry(
         "alias": bool(entry.get("alias", False)),
         "notes": entry.get("notes", ""),
     }
+
+  cat_data = None
+  if catalog is _CATALOG_SENTINEL:
+    try:
+      import catalog as cat_lib
+      cat_data = cat_lib.read_catalog()
+    except Exception:
+      cat_data = None
+  elif catalog is not None and isinstance(catalog, dict):
+    cat_data = catalog
+
+  if cat_data:
+    for entry in cat_data.get("models") or []:
+      mid = entry.get("model_id")
+      if not mid:
+        continue
+      info = registry.setdefault(
+          mid,
+          {
+              "enum": None,
+              "enum_source": None,
+              "label": mid,
+              "billing": {"unit": "unknown"},
+              "alias": False,
+              "notes": "",
+          },
+      )
+      if entry.get("label"):
+        info["label"] = entry["label"]
+      if entry.get("enum"):
+        info["enum"] = entry["enum"]
+        info["enum_source"] = "live"
+      elif info.get("enum_source") is None:
+        info["enum_source"] = "live"
+
+      info["remaining_fraction"] = entry.get("remaining_fraction")
+      info["reset_time"] = entry.get("reset_time")
+      info["quota_group"] = entry.get("quota_group")
+      info["recommended"] = bool(entry.get("recommended", False))
+      if entry.get("tag"):
+        info["tag"] = entry["tag"]
+
+      if not info["billing"].get("bucket") and entry.get("quota_group"):
+        info["billing"]["bucket"] = entry["quota_group"]
+        info["billing"]["bucket_inferred"] = True
 
   for model_id, entry in ((config or {}).get("custom_models") or {}).items():
     info = registry.setdefault(
@@ -240,7 +348,6 @@ def load_registry(
             f" {like!r}"
         )
       info["billing"] = dict(registry[like]["billing"])
-      # Appended (not replaced) so the assumption stays visible.
       info["notes"] = (
           f"{info.get('notes', '')} Billing assumed same as {like}; verify."
       ).strip()
@@ -248,6 +355,7 @@ def load_registry(
       info["billing"] = dict(entry["billing"])
     if "alias" in entry:
       info["alias"] = bool(entry["alias"])
+
   return registry
 
 
@@ -260,44 +368,39 @@ def suggest_models(model_id: str, registry: dict[str, Any]) -> list[str]:
 def resolve_model(
     model_id: str, registry: dict[str, Any], require_enum: bool = True
 ) -> dict[str, Any]:
-  """Returns the registry entry for model_id plus its id, or raises.
+  """Returns the registry entry for model_id plus its id, or raises."""
+  target_id = model_id
+  if target_id not in registry:
+    try:
+      import catalog as cat_lib
+      target_id = cat_lib.resolve_query(model_id, registry)
+    except ConfigError:
+      pass
 
-  Args:
-    model_id: Model id to resolve.
-    registry: Output of load_registry.
-    require_enum: Subagent pins need an enum. The orchestrator does not: its
-      model comes from the IDE's model picker, so only its billing matters.
-
-  Returns:
-    The registry entry with model_id added.
-
-  Raises:
-    ConfigError: when an enum is required and none is known.
-  """
-  info = registry.get(model_id)
+  info = registry.get(target_id)
   if not require_enum and (info is None or not info.get("enum")):
     resolved = dict(info or {
-        "label": model_id,
+        "label": target_id,
         "billing": {"unit": "unknown"},
         "alias": False,
         "notes": "",
     })
-    resolved.update({"model_id": model_id, "enum": resolved.get("enum")})
+    resolved.update({"model_id": target_id, "enum": resolved.get("enum")})
     resolved.setdefault("enum_source", None)
     resolved["billing"] = dict(resolved.get("billing") or {"unit": "unknown"})
     resolved["billing"].setdefault("unit", "unknown")
     return resolved
   if info is None or not info.get("enum"):
-    close = suggest_models(model_id, registry)
+    close = suggest_models(target_id, registry)
     hint = ", ".join(close) if close else "none similar (see list_models)"
     raise ConfigError(
-        f"no enum known for model id {model_id!r}. Known: {hint}. To add it,"
+        f"no enum known for model id {target_id!r}. Known: {hint}. To add it,"
         " select that model in the model picker for a new conversation, send"
         " one message, then call the learn_model tool with that"
         " conversation's id."
     )
   resolved = dict(info)
-  resolved["model_id"] = model_id
+  resolved["model_id"] = target_id
   resolved["billing"] = dict(info.get("billing") or {"unit": "unknown"})
   resolved["billing"].setdefault("unit", "unknown")
   return resolved
@@ -311,35 +414,68 @@ def role_model_ids(config: dict[str, Any]) -> dict[str, str]:
   return ids
 
 
+def role_fallback_ids(config: dict[str, Any]) -> dict[str, str | None]:
+  """Returns role -> fallback model id after applying subagent fallback default."""
+  fb = config.get("fallbacks") or {}
+  ids = {"orchestrator": fb.get("orchestrator")}
+  sub_fb = fb.get("subagent")
+  for role in SUBAGENT_ROLES:
+    ids[role] = fb.get(role) or sub_fb
+  return ids
+
+
 def resolve_roles(
     config: dict[str, Any],
     registry: dict[str, Any],
     allow_unpinned: bool = False,
 ) -> dict[str, dict[str, Any]]:
-  """Resolves every role's model, collecting all errors before raising.
-
-  Args:
-    config: Loaded config.
-    registry: Output of load_registry.
-    allow_unpinned: Accept subagent models with no known enum. Their agents
-      are rendered without a pin and the verdict flags them. Used for the
-      plugin defaults so a fresh install still loads; set_models never sets
-      it.
-
-  Returns:
-    role -> resolved model info.
-  """
+  """Resolves every role's primary and fallback model."""
   resolved: dict[str, dict[str, Any]] = {}
   errors: list[str] = []
-  for role, model_id in role_model_ids(config).items():
+  primaries = role_model_ids(config)
+  fallbacks = role_fallback_ids(config)
+
+  for role in ALL_ROLES:
+    pri_id = primaries[role]
+    fb_id = fallbacks.get(role)
+    if fb_id and fb_id == pri_id:
+      errors.append(f"{role}: fallback model cannot be the same as primary ({pri_id})")
+
     try:
-      resolved[role] = resolve_model(
-          model_id,
+      resolved_primary = resolve_model(
+          pri_id,
           registry,
           require_enum=(role != "orchestrator" and not allow_unpinned),
       )
     except ConfigError as e:
       errors.append(f"{role}: {e}")
+      resolved_primary = {
+          "model_id": pri_id,
+          "label": pri_id,
+          "enum": None,
+          "billing": {"unit": "unknown"},
+      }
+
+    resolved_fb = None
+    if fb_id:
+      try:
+        resolved_fb = resolve_model(
+            fb_id,
+            registry,
+            require_enum=(role != "orchestrator" and not allow_unpinned),
+        )
+      except ConfigError as e:
+        errors.append(f"{role} (fallback): {e}")
+        resolved_fb = {
+            "model_id": fb_id,
+            "label": fb_id,
+            "enum": None,
+            "billing": {"unit": "unknown"},
+        }
+
+    resolved_primary["fallback"] = resolved_fb
+    resolved[role] = resolved_primary
+
   if errors:
     raise ConfigError("\n".join(errors))
   return resolved
@@ -391,7 +527,7 @@ def _assess_pair(
     return LEVEL_WARN, (
         f"Both token-metered on different buckets ({obucket} -> {sbucket},"
         f" {_fmt_limit(sb)}). Delegation moves tokens to a second budget, but"
-        f" they are still metered: keep {role} reads bounded and never treat"
+        " they are still metered: keep {role} reads bounded and never treat"
         " its tokens as free."
     )
   if ou == UNIT_CALLS and su == UNIT_CALLS:
@@ -464,13 +600,16 @@ def orchestrator_doctrine(orch: dict[str, Any]) -> dict[str, Any]:
 
 
 def assess_economics(resolved: dict[str, dict[str, Any]]) -> dict[str, Any]:
-  """Judges whether the configured pairing actually saves quota."""
+  """Judges whether the configured pairings actually save quota."""
   orch = resolved["orchestrator"]
-  findings: list[dict[str, str]] = []
+  orch_fb = orch.get("fallback")
+  primary_findings: list[dict[str, str]] = []
+  fallback_findings: list[dict[str, str]] = []
+
   for role in ALL_ROLES:
     info = resolved[role]
     if info.get("alias"):
-      findings.append({
+      primary_findings.append({
           "level": LEVEL_WARN,
           "role": role,
           "message": (
@@ -478,32 +617,78 @@ def assess_economics(resolved: dict[str, dict[str, Any]]) -> dict[str, Any]:
               " moving target."
           ),
       })
+    fb = info.get("fallback")
+    if fb and fb.get("alias"):
+      fallback_findings.append({
+          "level": LEVEL_WARN,
+          "role": f"{role} (fallback)",
+          "message": (
+              f"{fb['model_id']} is a server-side alias; pinning it pins a"
+              " moving target."
+          ),
+      })
+
   for role in SUBAGENT_ROLES:
-    if not resolved[role].get("enum"):
-      findings.append({
+    info = resolved[role]
+    if not info.get("enum"):
+      primary_findings.append({
           "level": LEVEL_RISK,
           "role": role,
           "message": (
               f"{role} is not pinned: no enum is known for"
-              f" {resolved[role]['model_id']}, so it runs on whatever model the"
-              " IDE picks (usually the orchestrator's own). Teach the model"
-              " with learn_model, then call set_models."
+              f" {info['model_id']}, so it runs on whatever model the IDE picks"
+              " (usually the orchestrator's own). Teach the model with"
+              " learn_model, then call set_models."
           ),
       })
-      continue
-    level, message = _assess_pair(role, orch, resolved[role])
-    findings.append({"level": level, "role": role, "message": message})
+    else:
+      level, message = _assess_pair(role, orch, info)
+      primary_findings.append({"level": level, "role": role, "message": message})
 
-  levels = {f["level"] for f in findings}
-  if LEVEL_RISK in levels:
+    fb = info.get("fallback")
+    if fb:
+      if not fb.get("enum"):
+        fallback_findings.append({
+            "level": LEVEL_RISK,
+            "role": f"{role} (fallback)",
+            "message": (
+                f"{role} fallback is not pinned: no enum is known for"
+                f" {fb['model_id']}. Teach the model with learn_model."
+            ),
+        })
+      else:
+        level, message = _assess_pair(f"{role} (fallback)", orch, fb)
+        fallback_findings.append({
+            "level": level,
+            "role": f"{role} (fallback)",
+            "message": message,
+        })
+        if orch_fb:
+          level_fb, msg_fb = _assess_pair(f"{role} (fallback)", orch_fb, fb)
+          fallback_findings.append({
+              "level": level_fb,
+              "role": f"{role} (fallback vs orch fallback)",
+              "message": msg_fb,
+          })
+
+  primary_levels = {f["level"] for f in primary_findings}
+  fallback_levels = {f["level"] for f in fallback_findings}
+
+  if LEVEL_RISK in primary_levels:
     mode = "counterproductive"
-  elif LEVEL_WARN in levels:
+  elif (
+      LEVEL_WARN in primary_levels
+      or LEVEL_RISK in fallback_levels
+      or LEVEL_WARN in fallback_levels
+  ):
     mode = "partial"
   else:
     mode = "offload"
+
+  all_findings = primary_findings + fallback_findings
   return {
       "mode": mode,
-      "findings": findings,
+      "findings": all_findings,
       "orchestrator": orchestrator_doctrine(orch),
   }
 
@@ -527,21 +712,155 @@ def load_active(
     config_path: str | None = None,
     registry_path: str | None = None,
 ) -> dict[str, Any]:
-  """Loads the plugin defaults, resolves every role and assesses economics.
-
-  Subagent models without a known enum are tolerated here (rendered
-  unpinned and flagged) so a fresh install loads before any model is learned.
-  """
+  """Loads config defaults, resolves roles and assesses economics."""
   config = load_config(config_path)
   registry = load_registry(config, registry_path=registry_path)
   return build_active(config, registry, allow_unpinned=True)
 
 
+def route_roles(
+    active: dict[str, Any],
+    catalog: dict[str, Any] | None = None,
+    names: dict[str, str] | None = None,
+    threshold: float | None = None,
+    fallback_names: dict[str, str] | None = None,
+) -> dict[str, Any]:
+  """Routes each role to primary or fallback based on catalog quotas."""
+  effective_names = dict(AGENT_NAMES)
+  if names:
+    effective_names.update(names)
+
+  effective_threshold = (
+      threshold
+      if threshold is not None
+      else float(active.get("config", {}).get("fallback_threshold", DEFAULT_FALLBACK_THRESHOLD))
+  )
+
+  if catalog is None:
+    routes: dict[str, Any] = {}
+    for role in ALL_ROLES:
+      pri_info = active["roles"][role]
+      use_name = (
+          None if role == "orchestrator" else effective_names.get(role)
+      )
+      routes[role] = {
+          "use_type_name": use_name,
+          "model_id": pri_info["model_id"],
+          "using_fallback": False,
+          "reason": "no live quota data; refresh with scripts/model_catalog.py",
+          "primary_quota": None,
+          "fallback_quota": None,
+      }
+    return routes
+
+  import catalog as cat_lib
+  is_stale = cat_lib.is_catalog_stale(catalog)
+  cat_models = {
+      m["model_id"]: m
+      for m in catalog.get("models", [])
+      if isinstance(m, dict) and "model_id" in m
+  }
+
+  routes = {}
+  for role in ALL_ROLES:
+    pri_info = active["roles"][role]
+    pri_id = pri_info["model_id"]
+    pri_cat = cat_models.get(pri_id)
+    pri_quota = (
+        {
+            "remaining_fraction": pri_cat.get("remaining_fraction"),
+            "reset_time": pri_cat.get("reset_time"),
+        }
+        if pri_cat
+        else None
+    )
+
+    fb_info = pri_info.get("fallback")
+    fb_id = fb_info["model_id"] if fb_info else None
+    fb_cat = cat_models.get(fb_id) if fb_id else None
+    fb_quota = (
+        {
+            "remaining_fraction": fb_cat.get("remaining_fraction"),
+            "reset_time": fb_cat.get("reset_time"),
+        }
+        if fb_cat
+        else None
+    )
+
+    pri_name = None if role == "orchestrator" else effective_names.get(role)
+    fb_name = None
+    if role != "orchestrator":
+      fb_name = (
+          (fallback_names or {}).get(role)
+          or f"{effective_names.get(role)}_fallback"
+      )
+
+    pri_rf = pri_cat.get("remaining_fraction") if pri_cat else None
+    absent = pri_cat is None
+    exhausted = pri_rf is not None and pri_rf <= effective_threshold
+
+    using_fb = False
+    chosen_id = pri_id
+    use_name = pri_name
+    action = None
+
+    if absent or exhausted:
+      if fb_info is not None:
+        fb_rf = fb_cat.get("remaining_fraction") if fb_cat else None
+        if fb_rf is None or (pri_rf is None or fb_rf > pri_rf):
+          using_fb = True
+          chosen_id = fb_id
+          use_name = fb_name
+          if absent:
+            reason = (
+                f"primary model {pri_id} is absent from live catalog; routed to"
+                f" fallback {fb_id}"
+            )
+          else:
+            reason = (
+                f"primary quota ({pri_rf*100:.1f}%) <= threshold"
+                f" ({effective_threshold*100:.1f}%); routed to fallback {fb_id}"
+            )
+          if role == "orchestrator":
+            action = f"Ask the user to run /model and pick '{fb_info['label']}'"
+        else:
+          reason = (
+              f"fallback quota ({fb_rf*100:.1f}%) is not better than primary"
+              f" ({pri_rf*100:.1f}%); staying on primary"
+          )
+      else:
+        if absent:
+          reason = (
+              f"primary model {pri_id} is absent from catalog and no fallback is"
+              " configured"
+          )
+        else:
+          reason = (
+              f"primary quota ({pri_rf*100:.1f}%) <= threshold"
+              f" ({effective_threshold*100:.1f}%) but no fallback is configured"
+          )
+    else:
+      reason = "primary quota is healthy"
+
+    role_dict: dict[str, Any] = {
+        "use_type_name": use_name,
+        "model_id": chosen_id,
+        "using_fallback": using_fb,
+        "reason": reason,
+        "primary_quota": pri_quota,
+        "fallback_quota": fb_quota,
+    }
+    if action is not None:
+      role_dict["action"] = action
+    if is_stale:
+      role_dict["stale_catalog"] = True
+    routes[role] = role_dict
+
+  return routes
+
+
 # --------------------------------------------- learning enums from the IDE
 
-# gen_metadata rows hold length-prefixed key/value pairs; model_enum is the
-# enum of the model that served that turn. Structured, so no false positives
-# from prompt text.
 _MODEL_ENUM_FIELD_RE = re.compile(rb"\n\nmodel_enum\x12(.)", re.S)
 _CONV_ID_RE = re.compile(r"[A-Za-z0-9_\-]+")
 
@@ -552,10 +871,10 @@ def read_conversation_model_enum(
   """Returns the model enum that served a conversation's latest turn."""
   if not conversation_id or not _CONV_ID_RE.fullmatch(conversation_id):
     raise ConfigError(f"invalid conversation id {conversation_id!r}")
-  db_path = os.path.join(
-      conversations_dir or os.path.join(app_data_dir(), "conversations"),
-      f"{conversation_id}.db",
-  )
+  if conversations_dir is None:
+    app_dir = find_app_dir_for_conversation(conversation_id) or app_data_dir()
+    conversations_dir = os.path.join(app_dir, "conversations")
+  db_path = os.path.join(conversations_dir, f"{conversation_id}.db")
   if not os.path.exists(db_path):
     raise ConfigError(f"no conversation database at {db_path}")
   try:
@@ -588,21 +907,7 @@ def learn_model(
     conversations_dir: str | None = None,
     billing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-  """Records model_id -> enum from a conversation that ran on that model.
-
-  Args:
-    model_id: Name to record the model under (your choice).
-    conversation_id: A conversation whose last turn ran on that model.
-    label: Optional display label.
-    billing_like: Copy billing from another known model (flagged assumed).
-    config_path: Override for tests.
-    conversations_dir: Override for tests.
-    billing: Explicit billing: {unit: tokens|calls|unknown, bucket,
-      daily_limit, token_weights, cache_ttl_seconds}. Wins over billing_like.
-
-  Returns:
-    What was recorded, plus other ids already mapped to the same enum.
-  """
+  """Records model_id -> enum from a conversation that ran on that model."""
   model_id = (model_id or "").strip()
   if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\-]*", model_id):
     raise ConfigError(f"invalid model id {model_id!r}")
@@ -641,5 +946,40 @@ def learn_model(
       "enum": enum,
       "learned_from": conversation_id,
       "also_known_as": clashes,
+      "entry": entry,
+  }
+
+
+def set_model_info(
+    model_id: str,
+    label: str | None = None,
+    billing_like: str | None = None,
+    billing: dict[str, Any] | None = None,
+    config_path: str | None = None,
+) -> dict[str, Any]:
+  """Records label and billing in custom_models without requiring an enum."""
+  model_id = (model_id or "").strip()
+  if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\-]*", model_id):
+    raise ConfigError(f"invalid model id {model_id!r}")
+  if billing is not None:
+    if not isinstance(billing, dict) or billing.get("unit") not in KNOWN_UNITS:
+      raise ConfigError(
+          f"billing.unit must be one of {list(KNOWN_UNITS)}, got {billing!r}"
+      )
+  config = load_config(config_path)
+  registry = load_registry(config)
+  entry = dict(config["custom_models"].get(model_id) or {})
+  if label:
+    entry["label"] = label
+  if billing_like:
+    if billing_like not in registry:
+      raise ConfigError(f"billing_like refers to unknown model {billing_like!r}")
+    entry["billing_like"] = billing_like
+  if billing is not None:
+    entry["billing"] = dict(billing)
+  config["custom_models"][model_id] = entry
+  save_config(config, config_path)
+  return {
+      "model_id": model_id,
       "entry": entry,
   }

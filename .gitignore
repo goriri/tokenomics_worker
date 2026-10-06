@@ -4,3 +4,4 @@ __pycache__/
 # Local model choices and learned enums; never commit.
 tokenomics.config.json
 .DS_Store
+agents/*_fallback/

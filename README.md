@@ -6,11 +6,25 @@ both models**. An expensive *orchestrator* keeps the judgment work
 *subagents* do the bulk reading, typing and waiting. The plugin also checks
 whether your pairing actually saves quota.
 
-Everything is driven from chat. You don't edit config files or run scripts.
+Everything is driven from chat, with the same model list the CLI's `/model`
+shows. You don't edit config files or run scripts.
 
 ```text
-/tokenomics-worker subagent=gemini-3.8-flash-high
+/tokenomics-worker models
 ```
+
+```text
+ #  Label                      Model ID                 Quota  Reset  Current
+--  -------------------------  -----------------------  -----  -----  ---------
+ 1  Gemini 3.8 Flash (High)    gemini-3.8-flash-high      78%  05:58  subagent
+ 2  Gemini 3.8 Flash (Medium)  gemini-3.8-flash-medium    78%  05:58
+ 3  Gemini 3.1 Pro             gemini-3.1-pro-high       100%  18:29  fallback
+...
+```
+
+followed by an interactive picker for the subagent model, its fallback, the
+orchestrator's fallback, and whether to keep the choice for this conversation
+or save it as your default.
 
 ## Why
 
@@ -55,7 +69,8 @@ flowchart LR
 | `tw_worker` | Implementer with a contract: mechanical test receipts, no weakened assertions, a 2-turn circuit breaker, and an `ASSIGNED_FILES_EXCLUSIVE` file boundary. |
 | `tw_redteam` | Single-turn fresh-context reviewer-fixer, run on a worker's diff before you read it. |
 | `tokenomics-worker` skill | Opt-in (`/tokenomics-worker`) delegation doctrine: tier routing, competing branches, worker prompt contract, anti-cheating gates, and cost rules that flip with the orchestrator's billing unit. |
-| `tokenomics-worker-tools` | MCP server that does model selection, enum learning, the pairing verdict, quota/cache estimates, and test-tampering checks. |
+| `tokenomics-worker-tools` | MCP server that does model selection, fallback routing, the pairing verdict, quota/cache estimates, and test-tampering checks. |
+| `scripts/model_catalog.py` | Run by the agent (not you): reads the CLI's live model list and quota from its local server and caches it for the MCP tools. |
 
 ## Requirements
 
@@ -81,58 +96,79 @@ run `/tokenomics-worker persist` once, so the agent prompts point at the right
 
 ## Quick start
 
-A fresh install ships **unpinned** subagents. The plugin never ships or
-guesses model enums (the internal IDs a pin needs), because a wrong one
-silently runs the wrong model. You teach it each subagent model once.
-
-1. **Teach it your subagent model.** Start a new conversation, select the
-   model you want for subagents (for example Gemini 3.8 Flash, high thinking)
-   in the model picker, and send one message. Copy that conversation's ID.
-2. **Record it.** In any conversation, say:
+1. **Pick the orchestrator.** In the CLI, choose the `tw_orchestrator` agent
+   and your orchestrator model with `/model` (or the IDE's model picker).
+2. **Pick subagents:**
 
    ```text
-   learn_model gemini-3.8-flash-high from conversation <that id>, billing unit calls
+   /tokenomics-worker models
    ```
 
-   The name (`gemini-3.8-flash-high`) is yours to choose; it is what you type
-   later. The tool reads the model enum from the IDE's own record of that
-   conversation and saves it.
-3. **Pick the orchestrator.** Open a new conversation, choose the
-   `tw_orchestrator` agent and your orchestrator model (for example Claude Opus
-   5.5) in the picker.
-4. **Pin the subagents:**
+   The agent refreshes the model catalog, shows the table, and asks you to
+   pick. Or name them directly, by id, label or a loose query:
 
    ```text
-   /tokenomics-worker subagent=gemini-3.8-flash-high orchestrator=opus-5.5-high
+   /tokenomics-worker subagent="Gemini 3.8 Flash (High)" fallback="Gemini 3.1 Pro"
+   /tokenomics-worker subagent=flash-high fallback=pro persist
    ```
 
-   The pins load on the next turn, with no restart. `orchestrator=` only tells
-   the cost check which model you picked.
-5. **Make it the default** for new conversations (optional): add `persist`
-   to the same command, then restart the IDE.
+   The pins load on the next turn, with no restart. With `persist` they
+   become your defaults for new conversations (after an IDE/CLI restart).
+3. **Check it** any time: "show my tokenomics-worker models". You get the
+   models per role, fallbacks, remaining quota, which TypeName each role is
+   routed to right now, and the pairing verdict.
+
+A fresh install ships **unpinned** subagents. The plugin never ships model
+enums (the internal IDs a pin needs); it reads them from your own CLI's model
+list at runtime, or learns them from a conversation (`learn_model`) for
+models the list doesn't include.
 
 ## Choosing models
 
 | What | How |
 | :--- | :-- |
-| Orchestrator | The IDE's model picker. |
-| Subagents, this conversation | `/tokenomics-worker subagent=<id>`; per role: `scout=<id> worker=<id> redteam=<id>` |
-| Subagents, as defaults | Add `persist`. Saves `tokenomics.config.json` and re-renders `agents/`. Takes effect after an IDE restart. |
-| Preview the verdict only | Ask for a dry run (`set_models` with `dry_run: true`). |
+| Interactive picker | `/tokenomics-worker models`: the model table plus a picker for subagent, subagent fallback, orchestrator fallback, and scope. |
+| Orchestrator | `/model` in the CLI (or the IDE's picker). The plugin reads your live model for the cost math. |
+| Subagents, this conversation | `/tokenomics-worker subagent=<model>`; per role: `scout=`, `worker=`, `redteam=` |
+| Fallbacks | `fallback=<model>` (all subagents), `<role>_fallback=<model>`, `orchestrator_fallback=<model>`, `threshold=0.1` |
+| As defaults | Add `persist`. Saves `tokenomics.config.json` and re-renders `agents/`. Takes effect after a restart. |
+| Preview only | Ask for a dry run (`set_models` with `dry_run: true`). |
 | Refuse bad pairings | `strict: true` refuses to install a `counterproductive` pairing. |
-| What's active? | "Show my tokenomics-worker config" calls `get_model_config`. |
-| Which model really answered? | `get_model_config` with a conversation ID returns `live_model`, the enum recorded for its last turn. |
-| Known models | "List tokenomics-worker models" calls `list_models`. |
+| Which model really answered? | `get_model_config` with a conversation ID returns `live_model`. |
+
+`<model>` can be a model id (`gemini-3.8-flash-high`), its label as `/model`
+shows it (`"Gemini 3.8 Flash (High)"`), or a loose query (`flash high`). An
+ambiguous query lists the candidates instead of guessing.
 
 Session pins get distinct TypeNames (for example
 `tw_worker_gemini_3_8_flash_high`) so the plugin's own `tw_worker` cannot
 shadow them. They are written to the conversation's own
 `<app data dir>/brain/<conversation id>/.agents/agents/` folder.
 
+### Fallbacks
+
+Every role can have a fallback model. Subagent fallbacks are pinned agents of
+their own (`tw_<role>_fallback`, or a model-named TypeName for session pins).
+
+```mermaid
+flowchart LR
+  R["route_models"] --> Q{"primary quota <= threshold, or primary gone from /model list?"}
+  Q -->|no| P["dispatch to primary"]
+  Q -->|yes, fallback has more quota| F["dispatch to fallback"]
+  P -->|"quota / capacity / 429 error"| F
+```
+
+- Before each fan-out the orchestrator calls `route_models`, which compares
+  the live quota of the primary and the fallback (default threshold 5%).
+- If a dispatch still fails with a quota, capacity or unavailable-model
+  error, the orchestrator re-sends it once to the fallback and tells you.
+- The orchestrator can't change its own model. When its quota runs low, it
+  asks you to run `/model` and pick your orchestrator fallback.
+
 ## Billing and the pairing verdict
 
-Give each model a billing block, either when you teach it (`learn_model ...
-billing unit calls`) or later by hand in `tokenomics.config.json`:
+Give each model a billing block from chat ("set_model_info gemini-3.8-flash-high
+billing unit calls"), or by hand in `tokenomics.config.json`:
 
 ```json
 "billing": {
@@ -171,28 +207,41 @@ cost doctrine on its billing unit:
 
 | Tool | What it does |
 | :--- | :----------- |
-| `set_models` | Choose orchestrator, subagent and per-role models. Installs session pins by default. `persist` saves them as defaults, `dry_run` previews, `strict` refuses counterproductive pairings. Returns the TypeNames to use and the verdict. |
-| `get_model_config` | Defaults per role (model, pinned?, enum, billing), the verdict and cost rules, session pins, and `live_model` for a conversation. |
-| `list_models` | Known model IDs, labels, enums and billing, with an optional filter. |
-| `learn_model` | Records a model's enum from a conversation that ran on it, plus an optional `label`, `billing` or `billing_like`. |
+| `list_models` | The CLI's model list (from the catalog cache) with labels, quota %, reset time and inferred quota groups, plus a ready-to-show `picker` table with current selections marked. |
+| `set_models` | Choose subagent, per-role and fallback models by id, label or query. Installs session pins by default; `persist` saves them as defaults, `dry_run` previews, `strict` refuses counterproductive pairings. Uses your live model as orchestrator unless told otherwise. Returns TypeNames, fallback TypeNames, routing and the verdict. |
+| `get_model_config` | Defaults per role (model, pinned?, billing, fallback), the verdict and cost rules, session pins, `live_model`, catalog freshness, and `routing`. |
+| `route_models` | Cheap re-check before a fan-out: which TypeName to use per role right now, and whether the orchestrator should switch. |
+| `learn_model` | Records a model's enum from a conversation that ran on it, for models the CLI list doesn't include. |
+| `set_model_info` | Records a model's label or billing (`unit`: `tokens`/`calls`, `bucket`, `daily_limit`, ...) without needing an enum. |
 | `get_quota_status` | Usage estimate per bucket from the local ledger and the configured limits. |
 | `get_cache_status` | Prompt-cache warmth estimate for the configured orchestrator. It says when cache state doesn't affect quota. |
 | `detect_test_tampering` | Flags weakened, deleted or skipped assertions in a diff. |
 | `record_orchestration_event` | Appends to the local ledger `<app data dir>/telemetry/tokenomics_events.jsonl`. Nothing leaves your machine. |
 
-Quota and cache figures are **estimates** computed from your configured
-billing. The plugin doesn't query any provider's billing backend.
+### Where the model list comes from
+
+`scripts/model_catalog.py` runs inside the agent's shell, where the CLI
+provides `ANTIGRAVITY_LS_ADDRESS` and a per-session token for its local
+server. It asks that server for the model configs (the same data behind
+`/model`), sends the token only to localhost, and writes a token-free cache
+to `<app data dir>/plugin_data/tokenomics-worker/model_catalog.json`. The
+MCP server only reads that cache. Without those variables it falls back to
+`agy models` (ids and labels, no quota). Models that share identical quota
+numbers are grouped into an inferred quota bucket for the shared-bucket check.
 
 ## Files
 
 | File | Purpose | Committed? |
 | :--- | :------ | :--------- |
-| `tokenomics.default.json` | Shipped defaults: orchestrator, subagent, role overrides | yes |
+| `tokenomics.default.json` | Shipped defaults: orchestrator, subagent, role overrides, fallbacks, threshold | yes |
 | `tokenomics.config.json` | **Your** choices and learned enums, written by `set_models persist` and `learn_model` | no (gitignored) |
 | `models.json` | Optional shared labels and billing; never enums | yes |
 | `templates/agents/*.json` | Agent templates. Edit these, not `agents/`. | yes |
 | `agents/tw_*/agent.json` | Rendered from templates and the active config | yes (rendered from defaults) |
-| `lib/tokenomics_config.py` | Config loading, model resolution, economics, enum learning | yes |
+| `agents/tw_*_fallback/` | Fallback agents rendered when you persist fallbacks | no (gitignored) |
+| `lib/tokenomics_config.py` | Config loading, model resolution, fallbacks, routing, economics, enum learning | yes |
+| `lib/catalog.py` | Live model catalog: fetch, cache, label/query resolution, picker table | yes |
+| `scripts/model_catalog.py` | Agent-run catalog refresh | yes |
 | `lib/render.py` | Agent rendering and session pins | yes |
 | `mcp/tokenomics_tools_server.py` | The MCP server (stdio, stdlib only) | yes |
 | `scripts/verify_and_record.py` | End-of-task gate plus `verify-citations`, `lint-readability` and `recover-transcript` modes | yes |
@@ -217,6 +266,8 @@ Troubleshooting.
 | :------ | :-- |
 | Agents call `scripts/verify_and_record.py` at the wrong path | Set `TOKENOMICS_PLUGIN_DIR` (see Install) and re-run `set_models persist`. |
 | "cannot find the IDE app data directory" | The plugin looks for a folder under `~/.gemini/` containing `conversations/` and `brain/`. Set `TOKENOMICS_APP_DIR` in the MCP server's environment to override. |
+| `list_models` says there is no catalog | Ask the agent to refresh it (`python3 <plugin>/scripts/model_catalog.py`). It must run inside a CLI/IDE agent shell to see the live list. |
+| Routing says `stale_catalog` | Same: refresh the catalog. Quota numbers older than 15 minutes are not trusted. |
 | `learn_model`: "no recorded model_enum yet" | Send at least one message in that conversation first. |
 | Verdict says a role is **not pinned** | Teach that model with `learn_model`, then run `set_models`. |
 | A `tw_*` TypeName is "not found" | A malformed `agent.json` stops the agent loading. Check that you edited `templates/`, not `agents/`, and re-run `set_models persist`. A stray `agent.md` next to `agent.json` also shadows it; `set_models` deletes one when it finds it. |
@@ -224,6 +275,9 @@ Troubleshooting.
 
 ## Limitations
 
+- The live model list comes from the CLI's local server API, which isn't a
+  public contract. If it changes, the plugin falls back to `agy models`
+  (no quota) and `learn_model`.
 - Pinning relies on IDE behaviour that isn't formally documented: the
   `disable_model_selection` and `config.cascade_config.planner_config.plan_model`
   fields in `agent.json`, and the per-turn `model_enum` record in the

@@ -12,6 +12,9 @@ Tools:
   session pins that work immediately, or persists new plugin defaults.
 - learn_model: Records a model's enum by reading it from a conversation that
   runs on that model (pick it in the IDE's model picker first).
+- set_model_info: Records label and billing info for a model in custom_models
+  without requiring an enum.
+- route_models: Returns active routing decisions (primary vs fallback).
 - get_quota_status: Quota buckets, limits and cost rules for the configured
   models.
 - get_cache_status: Prompt cache state, TTL expiry and cost for a conversation.
@@ -37,6 +40,7 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib")
 )
 import render
+import catalog
 import tokenomics_config as tc
 
 logging.basicConfig(
@@ -140,7 +144,7 @@ def _enum_to_ids(registry: dict[str, Any], enum: str | None) -> list[str]:
 
 def _role_view(active: dict[str, Any], role: str) -> dict[str, Any]:
   info = active["roles"][role]
-  return {
+  view: dict[str, Any] = {
       "type_name": active["agents"][role],
       "model_id": info["model_id"],
       "label": info["label"],
@@ -151,12 +155,63 @@ def _role_view(active: dict[str, Any], role: str) -> dict[str, Any]:
       "alias": info.get("alias", False),
       "notes": info.get("notes", ""),
   }
+  fb = info.get("fallback")
+  if fb:
+    view["fallback"] = {
+        "model_id": fb["model_id"],
+        "label": fb["label"],
+        "pinned": bool(fb.get("enum")),
+        "enum": fb["enum"],
+        "enum_source": fb.get("enum_source"),
+        "billing": fb["billing"],
+        "alias": fb.get("alias", False),
+        "notes": fb.get("notes", ""),
+    }
+  else:
+    view["fallback"] = None
+  return view
 
 
 def get_model_config(conversation_id: str | None = None) -> dict[str, Any]:
   """Returns plugin defaults, session pins and the detected live model."""
   active = _active()
+  cat = catalog.read_catalog()
+  cat_view = None
+  if cat:
+    age = catalog.catalog_age_seconds(cat)
+    cat_view = {
+        "source": cat.get("source"),
+        "fetched_at": cat.get("fetched_at"),
+        "age_seconds": round(age, 1) if age is not None else None,
+        "stale": catalog.is_catalog_stale(cat),
+    }
+
+  names = dict(tc.AGENT_NAMES)
+  fallback_names = {
+      r: f"{tc.AGENT_NAMES[r]}_fallback"
+      for r in tc.SUBAGENT_ROLES
+      if active["roles"][r].get("fallback")
+  }
+  session = None
+  if conversation_id:
+    session = render.load_session(conversation_id)
+    if session:
+      names.update(
+          {r: e["type_name"] for r, e in session.get("subagents", {}).items()}
+      )
+      fallback_names.update({
+          r: e["fallback"]["type_name"]
+          for r, e in session.get("subagents", {}).items()
+          if e.get("fallback")
+      })
+
+  routing = tc.route_roles(
+      active, cat, names=names, fallback_names=fallback_names
+  )
+
   result: dict[str, Any] = {
+      "catalog": cat_view,
+      "routing": routing,
       "plugin_defaults": {
           "orchestrator": _role_view(active, "orchestrator"),
           "subagents": {r: _role_view(active, r) for r in tc.SUBAGENT_ROLES},
@@ -190,7 +245,6 @@ def get_model_config(conversation_id: str | None = None) -> dict[str, Any]:
           "Unknown enum. Call learn_model with the model id you selected in"
           " the picker and this conversation id to record it."
       )
-    session = render.load_session(conversation_id)
     if session:
       result["session_pins"] = session
   return result
@@ -237,69 +291,199 @@ def list_models(name_filter: str | None = None) -> dict[str, Any]:
   """Returns pinnable model ids with enum and billing."""
   config = tc.load_config()
   registry = tc.load_registry(config)
-  models = []
-  for model_id in sorted(registry):
-    info = registry[model_id]
-    if name_filter and name_filter.lower() not in model_id.lower():
+  active = tc.load_active()
+  cat = catalog.read_catalog()
+
+  current: dict[str, str] = {
+      "orchestrator": active["roles"]["orchestrator"]["model_id"]
+  }
+  for r in tc.SUBAGENT_ROLES:
+    current[r] = active["roles"][r]["model_id"]
+    fb = active["roles"][r].get("fallback")
+    if fb:
+      current[f"{r}_fallback"] = fb["model_id"]
+
+  models: list[dict[str, Any]] = []
+  seen: set[str] = set()
+
+  if cat:
+    for cm in cat.get("models") or []:
+      mid = cm.get("model_id")
+      if not mid:
+        continue
+      seen.add(mid)
+      if (
+          name_filter
+          and name_filter.lower() not in mid.lower()
+          and name_filter.lower() not in (cm.get("label") or "").lower()
+      ):
+        continue
+      reg_info = registry.get(mid, {})
+      rf = cm.get("remaining_fraction")
+      quota_str = f"{int(round(rf * 100))}%" if rf is not None else "-"
+      models.append({
+          "model_id": mid,
+          "label": cm.get("label") or mid,
+          "enum": cm.get("enum") or reg_info.get("enum"),
+          "pinnable": bool(cm.get("enum") or reg_info.get("enum")),
+          "enum_source": "live" if cm.get("enum") else reg_info.get("enum_source"),
+          "billing": render.billing_text(reg_info.get("billing") or {}),
+          "quota": quota_str,
+          "reset_time": cm.get("reset_time"),
+          "quota_group": cm.get("quota_group"),
+          "recommended": cm.get("recommended", False),
+          "notes": reg_info.get("notes", ""),
+      })
+
+  for mid in sorted(registry):
+    if mid in seen:
       continue
+    if name_filter and name_filter.lower() not in mid.lower():
+      continue
+    info = registry[mid]
     models.append({
-        "model_id": model_id,
+        "model_id": mid,
         "label": info.get("label"),
         "enum": info.get("enum"),
         "pinnable": bool(info.get("enum")),
         "enum_source": info.get("enum_source"),
         "billing": render.billing_text(info.get("billing") or {}),
+        "quota": "-",
+        "reset_time": None,
+        "quota_group": None,
+        "recommended": False,
         "notes": info.get("notes", ""),
     })
-  return {
-      "models": models,
-      "missing_a_model": (
-          "Select it in the IDE's model picker for any conversation, send one"
-          " message, then call learn_model with its id and that"
-          " conversation's id."
-      ),
-  }
+
+  result: dict[str, Any] = {"models": models}
+  if cat:
+    result["picker"] = catalog.picker_text(cat, current=current)
+    result["catalog_age_seconds"] = catalog.catalog_age_seconds(cat)
+  else:
+    result["catalog_note"] = (
+        "No live catalog cached. Run python3 <plugin>/scripts/model_catalog.py"
+        " to fetch and cache live models and quotas."
+    )
+  result["missing_a_model"] = (
+      "Select it in the IDE's model picker for any conversation, send one"
+      " message, then call learn_model with its id and that"
+      " conversation's id."
+  )
+  return result
 
 
 _CLEAR = ("", "none", "null", "default")
 
 
-def _apply_choices(config: dict[str, Any], args: dict[str, Any]) -> list[str]:
+def _normalize_arg(val: str, registry: dict[str, Any]) -> str:
+  clean = val.strip()
+  if clean in registry:
+    return clean
+  try:
+    return catalog.resolve_query(clean, registry)
+  except tc.ConfigError:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\-]*", clean):
+      return clean
+    raise
+
+
+def _apply_choices(
+    config: dict[str, Any], args: dict[str, Any], registry: dict[str, Any]
+) -> list[str]:
   """Applies orchestrator/subagent/role choices to config; returns changes."""
   changes = []
   for key in ("orchestrator", "subagent"):
     value = args.get(key)
-    if isinstance(value, str) and value.strip() and value.strip() != config[key]:
-      changes.append(f"{key}: {config[key]} -> {value.strip()}")
-      config[key] = value.strip()
+    if isinstance(value, str) and value.strip() and value.strip().lower() not in _CLEAR:
+      normalized = _normalize_arg(value, registry)
+      if normalized != config[key]:
+        changes.append(f"{key}: {config[key]} -> {normalized}")
+        config[key] = normalized
+
   for role in tc.SUBAGENT_ROLES:
     value = args.get(role)
     if value is None:
       continue
-    new = None if str(value).strip().lower() in _CLEAR else str(value).strip()
+    if str(value).strip().lower() in _CLEAR:
+      new = None
+    else:
+      new = _normalize_arg(str(value), registry)
     if config["role_overrides"].get(role) != new:
       changes.append(f"{role}: {config['role_overrides'].get(role)} -> {new}")
       config["role_overrides"][role] = new
+
+  fb_thresh = args.get("fallback_threshold")
+  if fb_thresh is not None:
+    val = float(fb_thresh)
+    if not (0.0 <= val <= 1.0):
+      raise ValueError("fallback_threshold must be between 0 and 1")
+    if config.get("fallback_threshold") != val:
+      changes.append(f"fallback_threshold: {config.get('fallback_threshold')} -> {val}")
+      config["fallback_threshold"] = val
+
+  fb_cfg = config.setdefault("fallbacks", dict(tc.DEFAULT_FALLBACKS))
+  fb_arg_map = {
+      "orchestrator": "orchestrator_fallback",
+      "subagent": "subagent_fallback",
+      "scout": "scout_fallback",
+      "worker": "worker_fallback",
+      "redteam": "redteam_fallback",
+  }
+  for target_key, arg_key in fb_arg_map.items():
+    if arg_key in args:
+      val = args[arg_key]
+      if val is None or str(val).strip().lower() in _CLEAR:
+        new_fb = None
+      else:
+        new_fb = _normalize_arg(str(val), registry)
+      if fb_cfg.get(target_key) != new_fb:
+        changes.append(f"{arg_key}: {fb_cfg.get(target_key)} -> {new_fb}")
+        fb_cfg[target_key] = new_fb
+
   return changes
 
 
-def _summary(active: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
+def _summary(
+    active: dict[str, Any],
+    names: dict[str, str],
+    fallback_names: dict[str, str] | None = None,
+) -> dict[str, Any]:
   roles = active["roles"]
+  orch_fb = roles["orchestrator"].get("fallback")
+  subagents = {}
+  for r in tc.SUBAGENT_ROLES:
+    fb = roles[r].get("fallback")
+    subagents[r] = {
+        "type_name": names[r],
+        "model_id": roles[r]["model_id"],
+        "enum": roles[r]["enum"],
+        "billing": render.billing_text(roles[r]["billing"]),
+        "fallback": (
+            {
+                "type_name": (fallback_names or {}).get(r, f"{names[r]}_fallback"),
+                "model_id": fb["model_id"],
+                "enum": fb["enum"],
+                "billing": render.billing_text(fb["billing"]),
+            }
+            if fb
+            else None
+        ),
+    }
   return {
       "orchestrator": {
           "model_id": roles["orchestrator"]["model_id"],
           "billing": render.billing_text(roles["orchestrator"]["billing"]),
           "note": "Runs on the model selected in the IDE's model picker.",
+          "fallback": (
+              {
+                  "model_id": orch_fb["model_id"],
+                  "billing": render.billing_text(orch_fb["billing"]),
+              }
+              if orch_fb
+              else None
+          ),
       },
-      "subagents": {
-          r: {
-              "type_name": names[r],
-              "model_id": roles[r]["model_id"],
-              "enum": roles[r]["enum"],
-              "billing": render.billing_text(roles[r]["billing"]),
-          }
-          for r in tc.SUBAGENT_ROLES
-      },
+      "subagents": subagents,
       "pairing_verdict": active["economics"]["mode"],
       "findings": active["economics"]["findings"],
       "orchestrator_cost_rules": active["economics"]["orchestrator"]["summary"],
@@ -316,18 +500,50 @@ def set_models(args: dict[str, Any]) -> dict[str, Any]:
     )
   config = tc.load_config()
   registry = tc.load_registry(config)
-  changes = _apply_choices(config, args)
+
+  changes = []
+  if conversation_id and not args.get("orchestrator"):
+    try:
+      enum = tc.read_conversation_model_enum(conversation_id)
+      if enum:
+        live_ids = _enum_to_ids(registry, enum)
+        if len(live_ids) == 1:
+          detected_id = live_ids[0]
+          if config["orchestrator"] != detected_id:
+            changes.append(
+                f"orchestrator: {config['orchestrator']} -> {detected_id}"
+                " (detected from live conversation)"
+            )
+            config["orchestrator"] = detected_id
+    except tc.ConfigError:
+      pass
+
+  changes.extend(_apply_choices(config, args, registry))
   active = tc.build_active(config, registry)
   mode = active["economics"]["mode"]
+
+  fallback_names = {
+      r: f"{tc.AGENT_NAMES[r]}_fallback"
+      for r in tc.SUBAGENT_ROLES
+      if active["roles"][r].get("fallback")
+  }
+  cat = catalog.read_catalog()
 
   if args.get("strict") and mode == "counterproductive":
     return {
         "status": "REFUSED",
         "reason": "pairing verdict is counterproductive and strict=true",
-        **_summary(active, tc.AGENT_NAMES),
+        **_summary(active, tc.AGENT_NAMES, fallback_names),
     }
   if args.get("dry_run"):
-    return {"status": "DRY_RUN", "changes": changes, **_summary(active, tc.AGENT_NAMES)}
+    return {
+        "status": "DRY_RUN",
+        "changes": changes,
+        "routing": tc.route_roles(
+            active, cat, names=tc.AGENT_NAMES, fallback_names=fallback_names
+        ),
+        **_summary(active, tc.AGENT_NAMES, fallback_names),
+    }
 
   result: dict[str, Any] = {"changes": changes}
   if persist:
@@ -335,19 +551,30 @@ def set_models(args: dict[str, Any]) -> dict[str, Any]:
     tc.save_config(config)
     for path, content in writes.items():
       render.write_file(path, content)
+    render.cleanup_fallback_agents(active=active)
     result["status"] = "PERSISTED"
     result["written"] = [tc.display_path(p) for p in writes]
     result["note"] = (
         "Plugin defaults updated; tw_scout/tw_worker/tw_redteam pick them up"
         " after an IDE restart."
     )
+
   if conversation_id:
     manifest = render.install_session(active, conversation_id)
     names = dict(tc.AGENT_NAMES)
     names.update({r: e["type_name"] for r, e in manifest["subagents"].items()})
+    fb_names = {
+        r: e["fallback"]["type_name"]
+        for r, e in manifest["subagents"].items()
+        if e.get("fallback")
+    }
     result["status"] = "PERSISTED_AND_SESSION" if persist else "SESSION"
     result["use_these_type_names"] = {r: names[r] for r in tc.SUBAGENT_ROLES}
-    result.update(_summary(active, names))
+    result["fallback_type_names"] = fb_names
+    result["routing"] = tc.route_roles(
+        active, cat, names=names, fallback_names=fb_names
+    )
+    result.update(_summary(active, names, fb_names))
     result["session_note"] = (
         "Session pins are written to this conversation's .agents directory."
         " Invoke them by the TypeNames above and omit the Model argument."
@@ -355,8 +582,52 @@ def set_models(args: dict[str, Any]) -> dict[str, Any]:
         " prompt-cache turn."
     )
   else:
-    result.update(_summary(active, tc.AGENT_NAMES))
+    result["use_these_type_names"] = {r: tc.AGENT_NAMES[r] for r in tc.SUBAGENT_ROLES}
+    result["fallback_type_names"] = fallback_names
+    result["routing"] = tc.route_roles(
+        active, cat, names=tc.AGENT_NAMES, fallback_names=fallback_names
+    )
+    result.update(_summary(active, tc.AGENT_NAMES, fallback_names))
+
   return result
+
+
+def route_models(args: dict[str, Any]) -> dict[str, Any]:
+  """Returns routing decisions for current configuration and live quotas."""
+  active = _active()
+  cat = catalog.read_catalog()
+  conversation_id = (args.get("conversation_id") or "").strip()
+  names = dict(tc.AGENT_NAMES)
+  fallback_names = {
+      r: f"{tc.AGENT_NAMES[r]}_fallback"
+      for r in tc.SUBAGENT_ROLES
+      if active["roles"][r].get("fallback")
+  }
+  if conversation_id:
+    session = render.load_session(conversation_id)
+    if session:
+      names.update(
+          {r: e["type_name"] for r, e in session.get("subagents", {}).items()}
+      )
+      fallback_names.update({
+          r: e["fallback"]["type_name"]
+          for r, e in session.get("subagents", {}).items()
+          if e.get("fallback")
+      })
+  routing = tc.route_roles(
+      active, cat, names=names, fallback_names=fallback_names
+  )
+  return {"routing": routing}
+
+
+def set_model_info_tool(args: dict[str, Any]) -> dict[str, Any]:
+  """Records label and billing for a model in custom_models without an enum."""
+  return tc.set_model_info(
+      model_id=args.get("model_id", ""),
+      label=args.get("label"),
+      billing_like=args.get("billing_like"),
+      billing=args.get("billing"),
+  )
 
 
 def learn_model_tool(args: dict[str, Any]) -> dict[str, Any]:
@@ -747,6 +1018,30 @@ def list_tools() -> list[dict[str, Any]]:
                   "scout": {"type": "string", "description": "Scout-only model id; 'none' clears."},
                   "worker": {"type": "string", "description": "Worker-only model id; 'none' clears."},
                   "redteam": {"type": "string", "description": "Red-team-only model id; 'none' clears."},
+                  "orchestrator_fallback": {
+                      "type": "string",
+                      "description": "Fallback model for orchestrator; 'none' clears.",
+                  },
+                  "subagent_fallback": {
+                      "type": "string",
+                      "description": "Default fallback model for subagents; 'none' clears.",
+                  },
+                  "scout_fallback": {
+                      "type": "string",
+                      "description": "Scout-only fallback model; 'none' clears.",
+                  },
+                  "worker_fallback": {
+                      "type": "string",
+                      "description": "Worker-only fallback model; 'none' clears.",
+                  },
+                  "redteam_fallback": {
+                      "type": "string",
+                      "description": "Red-team-only fallback model; 'none' clears.",
+                  },
+                  "fallback_threshold": {
+                      "type": "number",
+                      "description": "Quota remaining fraction below which fallbacks activate (0..1).",
+                  },
                   "persist": {"type": "boolean"},
                   "strict": {
                       "type": "boolean",
@@ -802,6 +1097,62 @@ def list_tools() -> list[dict[str, Any]]:
                   },
               },
               "required": ["model_id", "conversation_id"],
+          },
+      },
+      {
+          "name": "set_model_info",
+          "description": (
+              "Records label and billing info for a model in custom_models"
+              " without requiring an enum or a live conversation."
+          ),
+          "inputSchema": {
+              "type": "object",
+              "properties": {
+                  "model_id": {
+                      "type": "string",
+                      "description": "Id to record, e.g. gemini-3.8-flash-high.",
+                  },
+                  "label": {"type": "string"},
+                  "billing_like": {
+                      "type": "string",
+                      "description": "Known model id whose billing to assume.",
+                  },
+                  "billing": {
+                      "type": "object",
+                      "description": (
+                          "Optional explicit billing specification: unit"
+                          " (tokens|calls|unknown), bucket, daily_limit,"
+                          " token_weights, cache_ttl_seconds."
+                      ),
+                      "properties": {
+                          "unit": {
+                              "type": "string",
+                              "enum": ["tokens", "calls", "unknown"],
+                          },
+                          "bucket": {"type": "string"},
+                          "daily_limit": {"type": "number"},
+                          "token_weights": {"type": "object"},
+                          "cache_ttl_seconds": {"type": "integer"},
+                      },
+                  },
+              },
+              "required": ["model_id"],
+          },
+      },
+      {
+          "name": "route_models",
+          "description": (
+              "Returns active routing decisions (primary vs fallback) for"
+              " each role based on live quota data."
+          ),
+          "inputSchema": {
+              "type": "object",
+              "properties": {
+                  "conversation_id": {
+                      "type": "string",
+                      "description": "Optional conversation UUID to reflect session pins.",
+                  },
+              },
           },
       },
       {
@@ -919,6 +1270,8 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "list_models": lambda a: list_models(a.get("filter")),
     "set_models": set_models,
     "learn_model": learn_model_tool,
+    "set_model_info": set_model_info_tool,
+    "route_models": route_models,
     "get_quota_status": lambda a: get_quota_status(a.get("role")),
     "get_cache_status": lambda a: get_cache_status(a.get("conversation_id", "")),
     "detect_test_tampering": lambda a: detect_test_tampering(

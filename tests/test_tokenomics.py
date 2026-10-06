@@ -12,10 +12,12 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import http.server
 import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -23,10 +25,53 @@ ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 for sub in ("lib", "scripts", "mcp"):
   sys.path.insert(0, os.path.join(ROOT, sub))
 
+import catalog  # noqa: E402
 import render  # noqa: E402
 import tokenomics_config as tc  # noqa: E402
 import tokenomics_tools_server as srv  # noqa: E402
 import verify_and_record  # noqa: E402
+
+
+class FakeLSHandler(http.server.BaseHTTPRequestHandler):
+  """Fake Antigravity Language Server for testing catalog fetch."""
+  recorded_csrf: str | None = None
+  request_payload: bytes = b""
+
+  def do_POST(self):
+    FakeLSHandler.recorded_csrf = self.headers.get("x-codeium-csrf-token")
+    length = int(self.headers.get("Content-Length", 0))
+    FakeLSHandler.request_payload = self.rfile.read(length)
+    self.send_response(200)
+    self.send_header("Content-Type", "application/json")
+    self.end_headers()
+    payload = {
+        "clientModelConfigs": [
+            {
+                "modelId": "fast-high",
+                "label": "Fast model, high",
+                "isRecommended": True,
+                "modelOrAlias": {"model": "MODEL_FAKE_FAST_HIGH"},
+                "quotaInfo": {
+                    # No remainingFraction -> proto3 zero value -> 0.0
+                    "resetTime": "2026-10-06T21:00:00Z",
+                },
+            },
+            {
+                "modelId": "fast-low",
+                "label": "Fast model, low",
+                "isRecommended": False,
+                "modelOrAlias": {"model": "MODEL_FAKE_FAST_LOW"},
+                "quotaInfo": {
+                    "remainingFraction": 0.8,
+                    "resetTime": "2026-10-06T21:00:00Z",
+                },
+            },
+        ]
+    }
+    self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+  def log_message(self, format, *args):
+    pass
 
 FIXTURE_REGISTRY = {
     "models": {
@@ -95,6 +140,14 @@ class FixtureMixin:
         "orchestrator": "big-tokens",
         "subagent": "fast-high",
         "role_overrides": {"scout": None, "worker": None, "redteam": None},
+        "fallbacks": {
+            "orchestrator": None,
+            "subagent": None,
+            "scout": None,
+            "worker": None,
+            "redteam": None,
+        },
+        "fallback_threshold": 0.05,
         "custom_models": {},
     }
     data.update(overrides)
@@ -112,6 +165,7 @@ class FixtureMixin:
     for p in (
         mock.patch.object(tc, "CONFIG_PATH", self.cfg_path),
         mock.patch.object(tc, "REGISTRY_PATH", registry),
+        mock.patch.object(catalog, "read_catalog", return_value=None),
         mock.patch.dict(os.environ, {tc.APP_DIR_ENV: self.app_dir}),
     ):
       p.start()
@@ -520,8 +574,20 @@ class LearnModelTest(FixtureMixin, unittest.TestCase):
 
 class ShippedFilesTest(unittest.TestCase):
 
+  def setUp(self):
+    p = mock.patch.object(catalog, "read_catalog", return_value=None)
+    p.start()
+    self.addCleanup(p.stop)
+
   def test_generated_agents_match_active_config(self):
-    """Fails if the config or a template changed without re-rendering."""
+    """Fails if the config or a template changed without re-rendering.
+
+    A clean checkout ships agents rendered from the defaults with no catalog.
+    With a private tokenomics.config.json, agents/ was re-rendered locally
+    from that config plus the live catalog cache, so compare against those.
+    """
+    if os.path.exists(tc.CONFIG_PATH):
+      mock.patch.stopall()
     stale = render.stale_files(tc.load_active())
     self.assertEqual(stale, [], "re-render with set_models persist=true")
 
@@ -562,7 +628,7 @@ class McpServerTest(FixtureMixin, unittest.TestCase):
     tools = srv.handle_json_rpc_request({"id": 2, "method": "tools/list"})
     names = {t["name"] for t in tools["result"]["tools"]}
     self.assertEqual(names, set(srv.TOOL_HANDLERS))
-    self.assertEqual(len(names), 8)
+    self.assertEqual(len(names), 10)
 
   def test_notifications_get_no_response(self):
     self.assertIsNone(
@@ -670,7 +736,381 @@ class VerifyAndRecordTest(unittest.TestCase):
     args = verify_and_record.build_parser().parse_args([])
     self.assertEqual(args.plugin_name, "tokenomics-worker")
     self.assertIsNone(args.conductor_model)
-    self.assertFalse(hasattr(args, "table_name"))
+    self.assertNotIn("table_name", vars(args))
+
+
+class CatalogLiveFetchTest(unittest.TestCase):
+
+  def test_fetch_live_catalog_via_fake_server(self):
+    server = http.server.HTTPServer(("127.0.0.1", 0), FakeLSHandler)
+    port = server.server_port
+    thread = threading.Thread(target=server.handle_request)
+    thread.daemon = True
+    thread.start()
+
+    env = {
+        "ANTIGRAVITY_LS_ADDRESS": f"127.0.0.1:{port}",
+        "ANTIGRAVITY_CSRF_TOKEN": "test-csrf-token",
+    }
+    result = catalog.fetch_live_catalog(env=env, timeout=5.0)
+    server.server_close()
+    thread.join(timeout=1.0)
+
+    self.assertEqual(FakeLSHandler.recorded_csrf, "test-csrf-token")
+    self.assertEqual(result["source"], "language_server")
+    models = result["models"]
+    self.assertEqual(len(models), 2)
+    self.assertEqual(models[0]["model_id"], "fast-high")
+    # Missing remainingFraction in proto3 JSON defaults to 0.0
+    self.assertEqual(models[0]["remaining_fraction"], 0.0)
+    self.assertEqual(models[1]["model_id"], "fast-low")
+    self.assertEqual(models[1]["remaining_fraction"], 0.8)
+    self.assertEqual(models[0]["quota_group"], "quota-group-1")
+    self.assertEqual(models[1]["quota_group"], "quota-group-2")
+
+  def test_refusal_of_non_local_hosts(self):
+    for bad_host in ("example.com:8080", "192.168.1.100:5000", "8.8.8.8:80"):
+      with self.assertRaisesRegex(tc.ConfigError, "non-local host"):
+        catalog.fetch_from_language_server(bad_host, "some-token")
+
+  def test_cli_models_fallback_parsing(self):
+    mock_proc = mock.Mock(
+        returncode=0,
+        stdout=(
+            "Fetching available models...\n"
+            "fast-high\tFast Model (High)\n"
+            "fast-low\tFast Model (Low)\n"
+        ),
+        stderr="",
+    )
+    with mock.patch("subprocess.run", return_value=mock_proc):
+      models = catalog.fetch_from_cli_models()
+      self.assertEqual(len(models), 2)
+      self.assertEqual(models[0]["model_id"], "fast-high")
+      self.assertEqual(models[0]["label"], "Fast Model (High)")
+      self.assertIsNone(models[0]["enum"])
+      self.assertIsNone(models[0]["remaining_fraction"])
+      self.assertIsNone(models[0]["quota_group"])
+
+  def test_quota_group_inference(self):
+    models = [
+        {"model_id": "m1", "remaining_fraction": 0.8, "reset_time": "2026-10-06T21:00:00Z"},
+        {"model_id": "m2", "remaining_fraction": 0.8, "reset_time": "2026-10-06T21:00:00Z"},
+        {"model_id": "m3", "remaining_fraction": 0.4, "reset_time": "2026-10-06T21:00:00Z"},
+        {"model_id": "m4", "remaining_fraction": None, "reset_time": None},
+    ]
+    catalog._assign_quota_groups(models)
+    self.assertEqual(models[0]["quota_group"], "quota-group-1")
+    self.assertEqual(models[1]["quota_group"], "quota-group-1")
+    self.assertEqual(models[2]["quota_group"], "quota-group-2")
+    self.assertIsNone(models[3]["quota_group"])
+
+
+class ResolveQueryTest(unittest.TestCase):
+
+  def setUp(self):
+    self.models = [
+        {"model_id": "fast-high", "label": "Fast Model (High)"},
+        {"model_id": "fast-low", "label": "Fast Model (Low)"},
+        {"model_id": "big-tokens", "label": "Big Model Token"},
+    ]
+
+  def test_exact_id(self):
+    self.assertEqual(catalog.resolve_query("fast-high", self.models), "fast-high")
+
+  def test_exact_label(self):
+    self.assertEqual(
+        catalog.resolve_query("fast model (high)", self.models), "fast-high"
+    )
+
+  def test_fuzzy_unique(self):
+    self.assertEqual(catalog.resolve_query("high fast", self.models), "fast-high")
+    self.assertEqual(catalog.resolve_query("low", self.models), "fast-low")
+
+  def test_ambiguous_raises_candidates(self):
+    with self.assertRaises(tc.ConfigError) as ctx:
+      catalog.resolve_query("fast", self.models)
+    self.assertIn("fast-high", str(ctx.exception))
+    self.assertIn("fast-low", str(ctx.exception))
+
+  def test_no_match_raises_close_candidates(self):
+    with self.assertRaises(tc.ConfigError) as ctx:
+      catalog.resolve_query("nonexistent-turbo", self.models)
+    self.assertIn("no model matches query", str(ctx.exception))
+
+  def test_exact_id_beats_fuzzy(self):
+    models = [
+        {"model_id": "fast", "label": "Fast Basic"},
+        {"model_id": "fast-high", "label": "Fast High"},
+    ]
+    self.assertEqual(catalog.resolve_query("fast", models), "fast")
+
+
+class FallbackConfigAndPrecedenceTest(FixtureMixin, unittest.TestCase):
+
+  def test_registry_precedence_with_catalog(self):
+    self.make_config(
+        custom_models={
+            "fast-high": {
+                "label": "Fast High Custom",
+                "enum": "MODEL_CUSTOM_HIGH",
+            },
+        }
+    )
+    fake_catalog = {
+        "fetched_at": "2026-10-06T20:00:00Z",
+        "source": "language_server",
+        "models": [
+            {
+                "model_id": "fast-high",
+                "label": "Fast High Live",
+                "enum": "MODEL_FAKE_FAST_HIGH",
+                "remaining_fraction": 0.5,
+                "reset_time": "2026-10-06T22:00:00Z",
+                "quota_group": "quota-group-1",
+                "recommended": True,
+            },
+            {
+                "model_id": "live-only-model",
+                "label": "Live Only Model",
+                "enum": "MODEL_FAKE_LIVE_ONLY",
+                "remaining_fraction": 0.9,
+                "reset_time": "2026-10-06T22:00:00Z",
+                "quota_group": "quota-group-2",
+                "recommended": False,
+            },
+        ],
+    }
+    reg = tc.load_registry(tc.load_config(), catalog=fake_catalog)
+    self.assertEqual(reg["fast-high"]["label"], "Fast High Custom")
+    self.assertEqual(reg["fast-high"]["enum"], "MODEL_CUSTOM_HIGH")
+    self.assertEqual(reg["fast-high"]["enum_source"], "custom_models")
+    self.assertEqual(reg["fast-high"]["remaining_fraction"], 0.5)
+    self.assertEqual(reg["fast-high"]["quota_group"], "quota-group-1")
+    self.assertIn("live-only-model", reg)
+    self.assertEqual(reg["live-only-model"]["enum_source"], "live")
+    self.assertEqual(
+        reg["live-only-model"]["billing"]["bucket"], "quota-group-2"
+    )
+    self.assertTrue(reg["live-only-model"]["billing"].get("bucket_inferred"))
+
+  def test_fallback_config_validation(self):
+    cfg = tc.load_config(
+        self.make_config(
+            fallbacks={"subagent": "fast-low"}, fallback_threshold=0.1
+        )
+    )
+    self.assertEqual(cfg["fallbacks"]["subagent"], "fast-low")
+    self.assertEqual(cfg["fallback_threshold"], 0.1)
+
+    with self.assertRaisesRegex(tc.ConfigError, "fallback_threshold"):
+      tc.load_config(self.make_config(fallback_threshold=1.5))
+
+    with self.assertRaisesRegex(tc.ConfigError, "same as primary"):
+      tc.resolve_roles(
+          tc.load_config(self.make_config(fallbacks={"subagent": "fast-high"})),
+          tc.load_registry(),
+      )
+
+
+class SessionAndFallbackRenderTest(FixtureMixin, unittest.TestCase):
+
+  def test_session_install_with_fallbacks(self):
+    cfg_path = self.make_config(
+        fallbacks={"subagent": "fast-low", "orchestrator": "big-calls"}
+    )
+    active = tc.build_active(tc.load_config(cfg_path), tc.load_registry())
+    brain_dir = os.path.join(self.app_dir, "brain")
+    manifest = render.install_session(active, "conv-fb", brain_root=brain_dir)
+    self.assertEqual(manifest["orchestrator_fallback"], "big-calls")
+    worker_fb = manifest["subagents"]["worker"]["fallback"]
+    self.assertIsNotNone(worker_fb)
+    self.assertEqual(worker_fb["model_id"], "fast-low")
+    self.assertEqual(worker_fb["type_name"], "tw_worker_fast_low")
+
+    pin_path = os.path.join(
+        brain_dir,
+        "conv-fb",
+        ".agents",
+        "agents",
+        "tw_worker_fast_low",
+        "agent.json",
+    )
+    self.assertTrue(os.path.exists(pin_path))
+
+  def test_plugin_default_fallback_rendering_and_cleanup(self):
+    cfg_path = self.make_config(fallbacks={"scout": "fast-low"})
+    active = tc.build_active(tc.load_config(cfg_path), tc.load_registry())
+    agents_dir = os.path.join(self.app_dir, "agents")
+    writes = render.planned_writes(active, agents_dir=agents_dir)
+    scout_fb_path = os.path.join(agents_dir, "tw_scout_fallback", "agent.json")
+    self.assertIn(scout_fb_path, writes)
+    for p, c in writes.items():
+      render.write_file(p, c)
+
+    stale_dir = os.path.join(agents_dir, "tw_stale_fallback")
+    os.makedirs(stale_dir, exist_ok=True)
+    removed = render.cleanup_fallback_agents(
+        agents_dir=agents_dir, active=active
+    )
+    self.assertIn(stale_dir, removed)
+    self.assertFalse(os.path.exists(stale_dir))
+    self.assertTrue(os.path.exists(os.path.join(agents_dir, "tw_scout_fallback")))
+
+
+class RoutingRulesTest(FixtureMixin, unittest.TestCase):
+
+  def setUp(self):
+    cfg_path = self.make_config(
+        fallbacks={"subagent": "fast-low", "orchestrator": "big-calls"},
+        fallback_threshold=0.05,
+    )
+    self.active = tc.build_active(tc.load_config(cfg_path), tc.load_registry())
+
+  def test_healthy_primary(self):
+    cat = {
+        "fetched_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "models": [
+            {"model_id": "fast-high", "remaining_fraction": 0.8},
+            {"model_id": "fast-low", "remaining_fraction": 0.9},
+            {"model_id": "big-tokens", "remaining_fraction": 0.5},
+            {"model_id": "big-calls", "remaining_fraction": 0.5},
+        ],
+    }
+    routes = tc.route_roles(self.active, cat)
+    self.assertFalse(routes["worker"]["using_fallback"])
+    self.assertEqual(routes["worker"]["model_id"], "fast-high")
+    self.assertIn("healthy", routes["worker"]["reason"])
+
+  def test_primary_exhausted_routes_to_fallback(self):
+    cat = {
+        "fetched_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "models": [
+            {"model_id": "fast-high", "remaining_fraction": 0.02},
+            {"model_id": "fast-low", "remaining_fraction": 0.8},
+            {"model_id": "big-tokens", "remaining_fraction": 0.5},
+        ],
+    }
+    routes = tc.route_roles(self.active, cat)
+    self.assertTrue(routes["worker"]["using_fallback"])
+    self.assertEqual(routes["worker"]["model_id"], "fast-low")
+    self.assertIn("routed to fallback", routes["worker"]["reason"])
+
+  def test_primary_missing_from_catalog(self):
+    cat = {
+        "fetched_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "models": [
+            {"model_id": "fast-low", "remaining_fraction": 0.8},
+            {"model_id": "big-tokens", "remaining_fraction": 0.5},
+        ],
+    }
+    routes = tc.route_roles(self.active, cat)
+    self.assertTrue(routes["worker"]["using_fallback"])
+    self.assertEqual(routes["worker"]["model_id"], "fast-low")
+    self.assertIn("absent from live catalog", routes["worker"]["reason"])
+
+  def test_fallback_worse_than_primary_stays_on_primary(self):
+    cat = {
+        "fetched_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "models": [
+            {"model_id": "fast-high", "remaining_fraction": 0.04},
+            {"model_id": "fast-low", "remaining_fraction": 0.01},
+            {"model_id": "big-tokens", "remaining_fraction": 0.5},
+        ],
+    }
+    routes = tc.route_roles(self.active, cat)
+    self.assertFalse(routes["worker"]["using_fallback"])
+    self.assertEqual(routes["worker"]["model_id"], "fast-high")
+    self.assertIn("not better than primary", routes["worker"]["reason"])
+
+  def test_no_catalog_stays_on_primary(self):
+    routes = tc.route_roles(self.active, catalog=None)
+    self.assertFalse(routes["worker"]["using_fallback"])
+    self.assertEqual(routes["worker"]["model_id"], "fast-high")
+    self.assertIn("no live quota data", routes["worker"]["reason"])
+
+  def test_orchestrator_routing_action(self):
+    cat = {
+        "fetched_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "models": [
+            {"model_id": "big-tokens", "remaining_fraction": 0.01},
+            {"model_id": "big-calls", "remaining_fraction": 0.8},
+            {"model_id": "fast-high", "remaining_fraction": 0.5},
+        ],
+    }
+    routes = tc.route_roles(self.active, cat)
+    orch = routes["orchestrator"]
+    self.assertTrue(orch["using_fallback"])
+    self.assertEqual(orch["model_id"], "big-calls")
+    self.assertIsNone(orch["use_type_name"])
+    self.assertEqual(
+        orch["action"],
+        "Ask the user to run /model and pick 'Big model, call-metered'",
+    )
+
+
+class McpServerExtendedTest(FixtureMixin, unittest.TestCase):
+
+  def test_set_models_defaults_orchestrator_from_live_model(self):
+    self.make_config(orchestrator="big-tokens", subagent="fast-high")
+    self.make_conversation("conv-live-orch", "MODEL_FAKE_BIG_CALLS")
+    err, body = self.call(
+        "set_models", {"conversation_id": "conv-live-orch"}
+    )
+    self.assertFalse(err, body)
+    self.assertEqual(
+        body["orchestrator"]["model_id"], "big-calls"
+    )
+    changes_str = " ".join(body["changes"])
+    self.assertIn("detected from live conversation", changes_str)
+
+  def test_list_models_with_picker(self):
+    self.make_config()
+    sample_catalog = {
+        "fetched_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": "language_server",
+        "models": [
+            {
+                "model_id": "fast-high",
+                "label": "Fast model, high",
+                "enum": "MODEL_FAKE_FAST_HIGH",
+                "remaining_fraction": 0.8,
+                "reset_time": "2026-10-06T21:00:00Z",
+                "recommended": True,
+            }
+        ],
+    }
+    with mock.patch.object(catalog, "read_catalog", return_value=sample_catalog):
+      err, body = self.call("list_models")
+      self.assertFalse(err, body)
+      self.assertIn("picker", body)
+      self.assertIn("Fast model, high", body["picker"])
+      self.assertIsNotNone(body.get("catalog_age_seconds"))
+
+  def test_route_models_tool(self):
+    self.make_config()
+    err, body = self.call("route_models")
+    self.assertFalse(err, body)
+    self.assertIn("routing", body)
+    self.assertIn("worker", body["routing"])
+
+  def test_set_model_info_tool(self):
+    self.make_config()
+    err, body = self.call(
+        "set_model_info",
+        {
+            "model_id": "brand-new-custom",
+            "label": "Brand New Custom",
+            "billing_like": "fast-high",
+        },
+    )
+    self.assertFalse(err, body)
+    self.assertEqual(body["model_id"], "brand-new-custom")
+    cfg = tc.load_config()
+    self.assertIn("brand-new-custom", cfg["custom_models"])
+    self.assertEqual(
+        cfg["custom_models"]["brand-new-custom"]["label"], "Brand New Custom"
+    )
 
 
 if __name__ == "__main__":

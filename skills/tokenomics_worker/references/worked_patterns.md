@@ -106,20 +106,23 @@ dispatch with the finding pasted in, or escalating to the user. It does not loop
 
 ## Pattern 4: switching subagent models for one session
 
-Cheaper scouts, stronger workers, for this conversation only. One MCP call on
-`tokenomics-worker-tools`:
+Cheaper scouts, stronger workers, with a fallback, for this conversation only.
+Refresh the catalog (`python3 {plugin}/scripts/model_catalog.py`), then one
+MCP call on `tokenomics-worker-tools` (labels from `/model` work as well as ids):
 
 ```json
 {"tool": "set_models", "arguments": {
   "conversation_id": "{current_conversation_id}",
-  "scout": "gemini-3.8-flash-low",
-  "worker": "gemini-3.8-flash-high",
+  "scout": "Gemini 3.8 Flash (Low)",
+  "worker": "Gemini 3.8 Flash (High)",
+  "subagent_fallback": "Gemini 3.1 Pro",
   "dry_run": true
 }}
 ```
 
-Read the pairing verdict in the dry run, then repeat without `dry_run` and use
-the returned `use_these_type_names`. Do this once at the start of the session:
+Read the pairing verdict and `routing` in the dry run, then repeat without
+`dry_run` and use the returned `use_these_type_names` (and
+`fallback_type_names` when a dispatch fails on quota or capacity). Do this once at the start of the session:
 installing agents invalidates the orchestrator's prompt cache. Add
 `"persist": true` only when the user wants the change as the plugin default.
 
