@@ -235,14 +235,33 @@ def load_config(path: str | None = None) -> dict[str, Any]:
           f"{cfg_path}: custom_models.{model_id}.enum must look like"
           f" MODEL_..., got {enum!r}"
       )
-    unit = (entry.get("billing") or {}).get("unit")
+    billing_cfg = entry.get("billing") or {}
+    if not isinstance(billing_cfg, dict):
+      raise ConfigError(
+          f"{cfg_path}: custom_models.{model_id}.billing must be an object"
+      )
+    unit = billing_cfg.get("unit")
     if unit is not None and unit not in KNOWN_UNITS:
       raise ConfigError(
           f"{cfg_path}: custom_models.{model_id}.billing.unit must be one of"
           f" {list(KNOWN_UNITS)}, got {unit!r}"
       )
+    inferred_cfg = billing_cfg.get("inferred")
+    if inferred_cfg is not None and not isinstance(inferred_cfg, dict):
+      raise ConfigError(
+          f"{cfg_path}: custom_models.{model_id}.billing.inferred must be an"
+          " object"
+      )
   data["custom_models"] = custom
   return data
+
+
+def is_manual_billing(billing: dict[str, Any] | None) -> bool:
+  """Returns True if billing has a known unit set manually (not via inference)."""
+  if not isinstance(billing, dict):
+    return False
+  unit = billing.get("unit")
+  return unit in (UNIT_TOKENS, UNIT_CALLS) and not billing.get("inferred")
 
 
 def save_config(data: dict[str, Any], path: str | None = None) -> None:
@@ -281,13 +300,15 @@ def load_registry(
     try:
       import catalog as cat_lib
       cat_data = cat_lib.read_catalog()
-    except Exception:
+    except (ImportError, OSError, ValueError, ConfigError):
       cat_data = None
   elif catalog is not None and isinstance(catalog, dict):
     cat_data = catalog
 
   if cat_data:
     for entry in cat_data.get("models") or []:
+      if not isinstance(entry, dict):
+        continue
       mid = entry.get("model_id")
       if not mid:
         continue
@@ -341,18 +362,28 @@ def load_registry(
     like = entry.get("billing_like")
     if entry.get("notes"):
       info["notes"] = entry["notes"]
-    if like and not entry.get("billing"):
+    if like:
       if like not in registry:
         raise ConfigError(
             f"custom_models.{model_id}.billing_like refers to unknown model"
             f" {like!r}"
         )
-      info["billing"] = dict(registry[like]["billing"])
-      info["notes"] = (
-          f"{info.get('notes', '')} Billing assumed same as {like}; verify."
-      ).strip()
+      raw_eb = entry.get("billing")
+      if not raw_eb or (isinstance(raw_eb, dict) and raw_eb.get("inferred")):
+        info["billing"] = dict(registry[like]["billing"])
+        info["notes"] = (
+            f"{info.get('notes', '')} Billing assumed same as {like}; verify."
+        ).strip()
     if entry.get("billing"):
-      info["billing"] = dict(entry["billing"])
+      new_b = dict(entry["billing"])
+      existing_b = dict(info.get("billing") or {})
+      if new_b.get("inferred") and is_manual_billing(existing_b):
+        pass
+      elif new_b.get("inferred"):
+        existing_b.update(new_b)
+        info["billing"] = existing_b
+      else:
+        info["billing"] = new_b
     if "alias" in entry:
       info["alias"] = bool(entry["alias"])
 
@@ -617,6 +648,20 @@ def assess_economics(resolved: dict[str, dict[str, Any]]) -> dict[str, Any]:
               " moving target."
           ),
       })
+    inferred = (info.get("billing") or {}).get("inferred")
+    if isinstance(inferred, dict) and (info.get("billing") or {}).get("unit") in (
+        UNIT_TOKENS,
+        UNIT_CALLS,
+    ):
+      primary_findings.append({
+          "level": LEVEL_WARN,
+          "role": role,
+          "message": (
+              f"billing for {info['model_id']} inferred from"
+              f" {inferred.get('samples', 0)} samples (confidence"
+              f" {inferred.get('confidence', 'unknown')})"
+          ),
+      })
     fb = info.get("fallback")
     if fb and fb.get("alias"):
       fallback_findings.append({
@@ -627,6 +672,23 @@ def assess_economics(resolved: dict[str, dict[str, Any]]) -> dict[str, Any]:
               " moving target."
           ),
       })
+    if fb:
+      fb_inferred = (fb.get("billing") or {}).get("inferred")
+      if isinstance(fb_inferred, dict) and (fb.get("billing") or {}).get(
+          "unit"
+      ) in (
+          UNIT_TOKENS,
+          UNIT_CALLS,
+      ):
+        fallback_findings.append({
+            "level": LEVEL_WARN,
+            "role": f"{role} (fallback)",
+            "message": (
+                f"billing for {fb['model_id']} inferred from"
+                f" {fb_inferred.get('samples', 0)} samples (confidence"
+                f" {fb_inferred.get('confidence', 'unknown')})"
+            ),
+        })
 
   for role in SUBAGENT_ROLES:
     info = resolved[role]
@@ -936,6 +998,8 @@ def learn_model(
     if billing_like not in registry:
       raise ConfigError(f"billing_like refers to unknown model {billing_like!r}")
     entry["billing_like"] = billing_like
+    if billing is None and (entry.get("billing") or {}).get("inferred"):
+      entry.pop("billing", None)
   if billing is not None:
     entry["billing"] = dict(billing)
   entry["notes"] = f"Enum learned from conversation {conversation_id}."
@@ -975,11 +1039,33 @@ def set_model_info(
     if billing_like not in registry:
       raise ConfigError(f"billing_like refers to unknown model {billing_like!r}")
     entry["billing_like"] = billing_like
+    if billing is None and (entry.get("billing") or {}).get("inferred"):
+      entry.pop("billing", None)
   if billing is not None:
-    entry["billing"] = dict(billing)
+    if billing.get("inferred"):
+      reg_billing = (registry.get(model_id) or {}).get("billing") or {}
+      cur_billing = entry.get("billing") or {}
+      if (
+          entry.get("billing_like")
+          or is_manual_billing(cur_billing)
+          or is_manual_billing(reg_billing)
+      ):
+        return {
+            "model_id": model_id,
+            "entry": entry,
+            "skipped": True,
+            "reason": "manual billing already set; never overwritten",
+        }
+      merged_b = dict(reg_billing)
+      merged_b.update(cur_billing)
+      merged_b.update(billing)
+      entry["billing"] = merged_b
+    else:
+      entry["billing"] = dict(billing)
   config["custom_models"][model_id] = entry
   save_config(config, config_path)
   return {
       "model_id": model_id,
       "entry": entry,
+      "skipped": False,
   }

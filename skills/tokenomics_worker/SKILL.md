@@ -42,21 +42,24 @@ plugin's `plugin.json`).
 
 ## Step 0: confirm the configuration before delegating
 
-1.  **Refresh the model catalog** (one shell command, run by you, not the
-    user):
+1.  **Refresh the model catalog and usage snapshot** (one shell command, run by
+    you, not the user):
 
     ```bash
     python3 {plugin}/scripts/model_catalog.py
     ```
 
     It reads the CLI's own model list (ids, labels, live quota and reset
-    times) and caches it for the MCP tools. It never stores credentials. Skip
-    it if `get_model_config` reports a catalog younger than 15 minutes.
+    times) and takes a measured token/call usage snapshot for your conversation
+    and its subagent children, caching both for the MCP tools. It never stores
+    credentials or message text. Skip it if `get_model_config` reports a
+    catalog younger than 15 minutes (unless you want a fresh usage snapshot).
 2.  **Call `get_model_config`** with your conversation id. It returns the
-    plugin defaults per role (model, pinned or not, billing, fallback), the
-    pairing verdict and findings, your cost rules, session pins, `live_model`
-    (the model that served your last turn), and `routing`: which TypeName to
-    use for each role right now.
+    plugin defaults per role (model, pinned or not, billing,
+    `billing_inference`, fallback), the pairing verdict and findings, your cost
+    rules, session pins, `live_model` (the model that served your last turn),
+    `usage` (cache age, snapshot count, tracked conversations), and `routing`:
+    which TypeName to use for each role right now.
 3.  **Check your own model.** If `live_model` is not the orchestrator the
     verdict assumes, re-run `set_models` with `conversation_id` only; it
     adopts your live model as the orchestrator.
@@ -421,13 +424,34 @@ states it; apply the matching section.
 -   **Concurrency has a ceiling.** Beyond 3 to 4 active agents on one machine,
     timing-sensitive gates produce false failures.
 
+### Billing inference
+
+The server exposes high-precision `remaining_fraction` per model but no billing
+unit (`calls` vs `tokens`). When a model's billing unit is `unknown`:
+
+1.  **Accumulate samples:** Each run of `python3 {plugin}/scripts/model_catalog.py`
+    records a quota-and-usage snapshot in `usage_snapshots.jsonl` (pass
+    `--conversation <id>` to include additional conversations, or `--no-usage`
+    to skip). Run it before and after workloads that exercise the target model
+    so at least 3–5 consecutive positive-usage pairs accumulate within the same
+    `reset_time` window.
+2.  **Inspect and apply:** Call `infer_billing` (optionally with `model_id`).
+    Once confidence is `medium` (>= 3 pairs, CV < 0.5) or `high` (>= 5 pairs,
+    CV < 0.25 and > 2x separation against the competing unit), call
+    `infer_billing` with `apply: true` to record `billing.inferred` in
+    `custom_models`. Manual billing set via `set_model_info` always wins and is
+    never overwritten.
+3.  **Noise caveat:** Usage from conversations not tracked in the snapshot
+    (other IDE windows, other clients) on the same quota pool adds noise to the
+    quota drop ratios.
+
 ### Check live consumption
 
 The `tokenomics-worker-tools` MCP server exposes `get_quota_status` and
-`get_cache_status` (estimates from the configured billing and the local
-ledger), `detect_test_tampering`, and `record_orchestration_event`. For real
-quota numbers use whatever your provider's console or CLI reports; the plugin
-does not query any billing backend.
+`get_cache_status` (reporting **measured** per-model calls and
+input/output/cache-read/cache-write tokens with `source: "measured"` when
+`usage.json` is present, or falling back to `source: "estimate"`),
+`infer_billing`, `detect_test_tampering`, and `record_orchestration_event`.
 
 ## Reference pipeline
 

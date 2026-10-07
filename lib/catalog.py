@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -51,11 +52,18 @@ def _parse_iso_utc(ts: str) -> datetime.datetime | None:
     return None
 
 
-def fetch_from_language_server(
-    address: str, token: str, timeout: float = 8.0
-) -> list[dict[str, Any]]:
-  """Fetches clientModelConfigs from the local Antigravity Language Server."""
-  clean_addr = address.strip()
+def call_language_server(
+    address: str,
+    token: str,
+    method: str,
+    payload: dict[str, Any] | None = None,
+    timeout: float = 8.0,
+) -> dict[str, Any]:
+  """Calls an RPC method on the local Antigravity Language Server."""
+  clean_addr = (address or "").strip()
+  clean_tok = (token or "").strip()
+  if not clean_addr or not clean_tok:
+    raise tc.ConfigError("Language server address and CSRF token are required")
   parsed = urllib.parse.urlsplit(f"http://{clean_addr}")
   host = parsed.hostname
   if host not in ("localhost", "127.0.0.1", "::1"):
@@ -65,24 +73,52 @@ def fetch_from_language_server(
     )
 
   url = (
-      f"http://{clean_addr}/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData"
+      f"http://{clean_addr}/exa.language_server_pb.LanguageServerService/{method}"
   )
   headers = {
       "Content-Type": "application/json",
       "Connect-Protocol-Version": "1",
-      "x-codeium-csrf-token": token.strip(),
+      "x-codeium-csrf-token": clean_tok,
   }
-  req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
+  body = json.dumps(payload or {}).encode("utf-8")
+  req = urllib.request.Request(url, data=body, headers=headers, method="POST")
   try:
     with urllib.request.urlopen(req, timeout=timeout) as resp:
       raw = resp.read().decode("utf-8")
+  except urllib.error.HTTPError as e:
+    try:
+      e.close()
+    except OSError:
+      pass
+    raise tc.ConfigError(
+        f"Language server HTTP {e.code} on {method}"
+    ) from None
   except Exception as e:
-    raise tc.ConfigError(f"Language server request failed: {e}") from e
+    msg = str(e)
+    if clean_tok and clean_tok in msg:
+      msg = msg.replace(clean_tok, "[REDACTED]")
+    raise tc.ConfigError(f"Language server request failed: {msg}") from None
 
   try:
     data = json.loads(raw)
+  except json.JSONDecodeError as e:
+    raise tc.ConfigError(
+        f"Language server returned invalid JSON (line {e.lineno} col {e.colno})"
+    ) from None
   except ValueError as e:
-    raise tc.ConfigError(f"Language server returned invalid JSON: {e}") from e
+    raise tc.ConfigError("Language server returned invalid JSON") from None
+  if not isinstance(data, dict):
+    raise tc.ConfigError("Language server returned non-object JSON")
+  return data
+
+
+def fetch_from_language_server(
+    address: str, token: str, timeout: float = 8.0
+) -> list[dict[str, Any]]:
+  """Fetches clientModelConfigs from the local Antigravity Language Server."""
+  data = call_language_server(
+      address, token, "GetCascadeModelConfigData", {}, timeout=timeout
+  )
 
   client_configs = data.get("clientModelConfigs") or []
   models: list[dict[str, Any]] = []
@@ -421,7 +457,8 @@ def _format_local_reset_time(rt: str | None) -> str:
 
 def picker_text(catalog: dict[str, Any] | None, current: Any = None) -> str:
   """Renders an aligned TUI model picker table."""
-  models = (catalog or {}).get("models") or []
+  raw_models = (catalog or {}).get("models") if isinstance(catalog, dict) else None
+  models = [m for m in (raw_models or []) if isinstance(m, dict)]
   if not models:
     return "No models available in catalog."
 
@@ -432,13 +469,16 @@ def picker_text(catalog: dict[str, Any] | None, current: Any = None) -> str:
 
   rows: list[tuple[str, str, str, str, str, str]] = []
   for idx, m in enumerate(ordered, 1):
-    mid = m.get("model_id") or ""
-    lbl = m.get("label") or mid
+    mid = str(m.get("model_id") or "")
+    lbl = str(m.get("label") or mid)
     tag = m.get("tag")
     if tag:
       lbl = f"{lbl} [{tag}]"
     rf = m.get("remaining_fraction")
-    quota_str = f"{int(round(rf * 100))}%" if rf is not None else "-"
+    if isinstance(rf, (int, float)) and not isinstance(rf, bool):
+      quota_str = f"{int(round(rf * 100))}%"
+    else:
+      quota_str = "-"
     reset_str = _format_local_reset_time(m.get("reset_time"))
     marker_parts = current_map.get(mid, [])
     marker_str = (

@@ -69,8 +69,8 @@ flowchart LR
 | `tw_worker` | Implementer with a contract: mechanical test receipts, no weakened assertions, a 2-turn circuit breaker, and an `ASSIGNED_FILES_EXCLUSIVE` file boundary. |
 | `tw_redteam` | Single-turn fresh-context reviewer-fixer, run on a worker's diff before you read it. |
 | `tokenomics-worker` skill | Opt-in (`/tokenomics-worker`) delegation doctrine: tier routing, competing branches, worker prompt contract, anti-cheating gates, and cost rules that flip with the orchestrator's billing unit. |
-| `tokenomics-worker-tools` | MCP server that does model selection, fallback routing, the pairing verdict, quota/cache estimates, and test-tampering checks. |
-| `scripts/model_catalog.py` | Run by the agent (not you): reads the CLI's live model list and quota from its local server and caches it for the MCP tools. |
+| `tokenomics-worker-tools` | MCP server that does model selection, fallback routing, the pairing verdict, measured usage/cache inspection, billing inference, and test-tampering checks. |
+| `scripts/model_catalog.py` | Run by the agent (not you): reads the CLI's live model list, quota, and per-conversation token usage from its local server and caches them for the MCP tools. |
 
 ## Requirements
 
@@ -203,18 +203,47 @@ cost doctrine on its billing unit:
 - **Call-metered ones** batch work into fewer turns and never spend a turn on
   keepalive.
 
+### Measured usage and billing inference
+
+Every time `scripts/model_catalog.py` runs (unless `--no-usage` is passed), it
+also reads per-model call and token counters from the local server's trajectory
+metadata for the current conversation and its subagent children:
+
+- `<app data dir>/plugin_data/tokenomics-worker/usage.json` caches sanitized
+  per-conversation usage (calls, input/output/cache-read/cache-write tokens per
+  model enum, plus child conversation IDs — never message text or tokens).
+- `<app data dir>/plugin_data/tokenomics-worker/usage_snapshots.jsonl` appends
+  one snapshot line pairing the catalog's high-precision `remaining_fraction`
+  with cumulative usage across tracked conversations.
+
+Because the server does not expose a model's billing unit directly,
+`infer_billing` compares consecutive snapshot pairs (within the same
+`reset_time` window and over conversations present in both snapshots) and fits
+quota drop against calls vs tokens across each quota group:
+
+- Call `infer_billing` to inspect fit (`units_per_full_quota` and coefficient
+  of variation `cv` for `calls`, `tokens_total`, and `tokens_uncached`) and
+  confidence (`high`, `medium`, `low`, or `insufficient`).
+- Call `infer_billing` with `apply: true` once confidence reaches `medium`
+  (>= 3 pairs, CV < 0.5) or `high` (>= 5 pairs, CV < 0.25 and > 2x separation)
+  to save `billing.inferred` into `custom_models`.
+- Inferred billing counts as a known unit for the pairing verdict with a
+  `warn` finding (`billing for X inferred from N samples (confidence C)`), and
+  never overwrites manually configured billing.
+
 ## MCP tools (`tokenomics-worker-tools`)
 
 | Tool | What it does |
 | :--- | :----------- |
 | `list_models` | The CLI's model list (from the catalog cache) with labels, quota %, reset time and inferred quota groups, plus a ready-to-show `picker` table with current selections marked. |
 | `set_models` | Choose subagent, per-role and fallback models by id, label or query. Installs session pins by default; `persist` saves them as defaults, `dry_run` previews, `strict` refuses counterproductive pairings. Uses your live model as orchestrator unless told otherwise. Returns TypeNames, fallback TypeNames, routing and the verdict. |
-| `get_model_config` | Defaults per role (model, pinned?, billing, fallback), the verdict and cost rules, session pins, `live_model`, catalog freshness, and `routing`. |
+| `get_model_config` | Defaults per role (model, pinned?, billing, `billing_inference`, fallback), the verdict and cost rules, session pins, `live_model`, catalog freshness, `usage` summary, and `routing`. |
 | `route_models` | Cheap re-check before a fan-out: which TypeName to use per role right now, and whether the orchestrator should switch. |
+| `infer_billing` | Infers a model's billing unit (`calls` vs `tokens`) from `usage_snapshots.jsonl` pairs; with `apply: true` saves `high`/`medium`-confidence results to `custom_models` without overwriting manual billing. |
 | `learn_model` | Records a model's enum from a conversation that ran on it, for models the CLI list doesn't include. |
 | `set_model_info` | Records a model's label or billing (`unit`: `tokens`/`calls`, `bucket`, `daily_limit`, ...) without needing an enum. |
-| `get_quota_status` | Usage estimate per bucket from the local ledger and the configured limits. |
-| `get_cache_status` | Prompt-cache warmth estimate for the configured orchestrator. It says when cache state doesn't affect quota. |
+| `get_quota_status` | Measured token/call usage per model when `usage.json` is present (`source: "measured"`), otherwise estimates (`source: "estimate"`), alongside configured limits and cost rules. |
+| `get_cache_status` | Prompt-cache state and measured cache read/write tokens (when `usage.json` is present) for the configured orchestrator. It says when cache state doesn't affect quota. |
 | `detect_test_tampering` | Flags weakened, deleted or skipped assertions in a diff. |
 | `record_orchestration_event` | Appends to the local ledger `<app data dir>/telemetry/tokenomics_events.jsonl`. Nothing leaves your machine. |
 
@@ -241,7 +270,8 @@ numbers are grouped into an inferred quota bucket for the shared-bucket check.
 | `agents/tw_*_fallback/` | Fallback agents rendered when you persist fallbacks | no (gitignored) |
 | `lib/tokenomics_config.py` | Config loading, model resolution, fallbacks, routing, economics, enum learning | yes |
 | `lib/catalog.py` | Live model catalog: fetch, cache, label/query resolution, picker table | yes |
-| `scripts/model_catalog.py` | Agent-run catalog refresh | yes |
+| `lib/usage.py` | Measured trajectory token usage, `usage.json` cache, snapshot ledger, billing inference | yes |
+| `scripts/model_catalog.py` | Agent-run catalog refresh and usage snapshot | yes |
 | `lib/render.py` | Agent rendering and session pins | yes |
 | `mcp/tokenomics_tools_server.py` | The MCP server (stdio, stdlib only) | yes |
 | `scripts/verify_and_record.py` | End-of-task gate plus `verify-citations`, `lint-readability` and `recover-transcript` modes | yes |
@@ -284,7 +314,9 @@ Troubleshooting.
   conversation database. Both may change between IDE versions. Verify pins
   after upgrading.
 - Not every enum is servable. Smoke-test a new pin before relying on it.
-- Billing data is whatever you enter. The verdict is only as good as that.
+- Billing data comes from what you enter (`set_model_info`) or from empirical
+  snapshot pairs (`infer_billing`). Concurrent usage in untracked conversations
+  or other IDE windows on the same quota pool adds noise to `infer_billing`.
 
 ## Development
 

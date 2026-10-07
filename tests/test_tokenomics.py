@@ -29,6 +29,7 @@ import catalog  # noqa: E402
 import render  # noqa: E402
 import tokenomics_config as tc  # noqa: E402
 import tokenomics_tools_server as srv  # noqa: E402
+import usage  # noqa: E402
 import verify_and_record  # noqa: E402
 
 
@@ -628,7 +629,7 @@ class McpServerTest(FixtureMixin, unittest.TestCase):
     tools = srv.handle_json_rpc_request({"id": 2, "method": "tools/list"})
     names = {t["name"] for t in tools["result"]["tools"]}
     self.assertEqual(names, set(srv.TOOL_HANDLERS))
-    self.assertEqual(len(names), 10)
+    self.assertEqual(len(names), 11)
 
   def test_notifications_get_no_response(self):
     self.assertIsNone(
@@ -1111,6 +1112,717 @@ class McpServerExtendedTest(FixtureMixin, unittest.TestCase):
     self.assertEqual(
         cfg["custom_models"]["brand-new-custom"]["label"], "Brand New Custom"
     )
+
+
+class FakeTrajectoryLSHandler(http.server.BaseHTTPRequestHandler):
+  """Fake Language Server serving GetCascadeTrajectory fixtures."""
+
+  fixtures: dict[str, dict] = {}
+  request_counts: dict[str, int] = {}
+
+  def do_POST(self):
+    length = int(self.headers.get("Content-Length", 0))
+    raw = self.rfile.read(length).decode("utf-8")
+    body = json.loads(raw) if raw else {}
+    cid = body.get("cascadeId", "")
+    FakeTrajectoryLSHandler.request_counts[cid] = (
+        FakeTrajectoryLSHandler.request_counts.get(cid, 0) + 1
+    )
+    payload = FakeTrajectoryLSHandler.fixtures.get(cid, {"trajectory": {}})
+    self.send_response(200)
+    self.send_header("Content-Type", "application/json")
+    self.end_headers()
+    self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+  def log_message(self, format, *args):
+    pass
+
+
+class TrajectoryUsageTest(FixtureMixin, unittest.TestCase):
+
+  def setUp(self):
+    self.make_config()
+    FakeTrajectoryLSHandler.request_counts = {}
+    FakeTrajectoryLSHandler.fixtures = {
+        "conv-root": {
+            "trajectory": {
+                "cascadeId": "conv-root",
+                "generatorMetadata": [
+                    {
+                        "stepIndices": [0, 1],
+                        "chatModel": {
+                            "systemPrompt": "SUPER_SECRET_PROMPT_TEXT_DO_NOT_PERSIST",
+                            "usage": {
+                                "model": "MODEL_FAKE_A",
+                                "inputTokens": "1000",
+                                "outputTokens": "250",
+                                "responseOutputTokens": "250",
+                                "cacheReadTokens": "5000",
+                                "cacheCreationTokens": "300",
+                                "messageId": "msg-1",
+                            },
+                            "retryInfos": [
+                                {
+                                    "error": "rate_limit",
+                                    "usage": {"model": "MODEL_FAKE_A"},
+                                },
+                                {
+                                    "usage": {
+                                        "model": "MODEL_FAKE_A",
+                                        "inputTokens": "1000",
+                                        "outputTokens": "250",
+                                        "responseOutputTokens": "250",
+                                        "cacheReadTokens": "5000",
+                                        "cacheCreationTokens": "300",
+                                        "messageId": "msg-1",
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "stepIndices": [2],
+                        "chatModel": {
+                            "usage": {
+                                "model": "MODEL_FAKE_A",
+                                "inputTokens": "400",
+                                "outputTokens": "100",
+                                "messageId": "msg-2",
+                            },
+                            "retryInfos": [
+                                {
+                                    "usage": {
+                                        "model": "MODEL_FAKE_A",
+                                        "inputTokens": "50",
+                                        "outputTokens": "10",
+                                        "messageId": "msg-2-retry1",
+                                    },
+                                },
+                                {
+                                    "usage": {
+                                        "model": "MODEL_FAKE_A",
+                                        "inputTokens": "400",
+                                        "outputTokens": "100",
+                                        "messageId": "msg-2",
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "stepIndices": [3],
+                        "chatModel": {
+                            "usage": {
+                                "model": "MODEL_FAKE_B",
+                                "inputTokens": "200",
+                                "messageId": "msg-3",
+                            },
+                        },
+                    },
+                    {
+                        "error": "unavailable",
+                        "chatModel": {
+                            "usage": {"model": "MODEL_FAKE_B"},
+                        },
+                    },
+                ],
+                "steps": [
+                    {
+                        "type": "CORTEX_STEP_TYPE_USER_INPUT",
+                        "content": "SUPER_SECRET_PROMPT_TEXT_DO_NOT_PERSIST",
+                    },
+                    {
+                        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                        "metadata": {
+                            "modelUsage": {
+                                "model": "MODEL_FAKE_A",
+                                "inputTokens": "1000",
+                                "outputTokens": "250",
+                                "cacheReadTokens": "5000",
+                                "cacheCreationTokens": "300",
+                                "messageId": "msg-1",
+                            }
+                        },
+                    },
+                    {
+                        "type": "CORTEX_STEP_TYPE_INVOKE_SUBAGENT",
+                        "invokeSubagent": {
+                            "results": [{"conversationId": "conv-child-1"}]
+                        },
+                    },
+                    {
+                        "type": "CORTEX_STEP_TYPE_CHECKPOINT",
+                        "checkpoint": {
+                            "subagentSnapshots": [
+                                {"result": {"conversationId": "conv-child-1"}},
+                                {"result": {"conversationId": "conv-child-2"}},
+                            ]
+                        },
+                    },
+                ],
+            }
+        },
+        "conv-child-1": {
+            "trajectory": {
+                "cascadeId": "conv-child-1",
+                "generatorMetadata": [
+                    {
+                        "chatModel": {
+                            "usage": {
+                                "model": "MODEL_FAKE_B",
+                                "inputTokens": "800",
+                                "outputTokens": "300",
+                                "cacheReadTokens": "2000",
+                            }
+                        }
+                    }
+                ],
+                "steps": [
+                    {
+                        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                        "metadata": {
+                            "modelUsage": {
+                                "model": "MODEL_FAKE_B",
+                                "inputTokens": "800",
+                                "outputTokens": "300",
+                                "cacheReadTokens": "2000",
+                            }
+                        },
+                    }
+                ],
+            }
+        },
+        "conv-child-2": {
+            "trajectory": {
+                "cascadeId": "conv-child-2",
+                "generatorMetadata": [],
+                "steps": [
+                    {
+                        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                        "metadata": {
+                            "modelUsage": {
+                                "model": "MODEL_FAKE_B",
+                                "inputTokens": "150",
+                                "outputTokens": "50",
+                            }
+                        },
+                    }
+                ],
+            }
+        },
+    }
+
+  def test_fetch_and_collect_usage_strips_messages_and_deduplicates(self):
+    server = http.server.HTTPServer(("127.0.0.1", 0), FakeTrajectoryLSHandler)
+    port = server.server_port
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+    self.addCleanup(server.shutdown)
+    self.addCleanup(server.server_close)
+
+    env = {
+        "ANTIGRAVITY_LS_ADDRESS": f"127.0.0.1:{port}",
+        "ANTIGRAVITY_CSRF_TOKEN": "secret-csrf-token-xyz",
+        "ANTIGRAVITY_CONVERSATION_ID": "conv-root",
+    }
+    root_u = usage.fetch_conversation_usage("conv-root", env=env, timeout=5.0)
+    self.assertEqual(
+        root_u["child_conversation_ids"], ["conv-child-1", "conv-child-2"]
+    )
+    self.assertEqual(
+        root_u["per_model"]["MODEL_FAKE_A"],
+        {
+            "calls": 3,
+            "input_tokens": 1450,
+            "output_tokens": 360,
+            "cache_read_tokens": 5000,
+            "cache_write_tokens": 300,
+        },
+    )
+    self.assertEqual(
+        root_u["per_model"]["MODEL_FAKE_B"],
+        {
+            "calls": 1,
+            "input_tokens": 200,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        },
+    )
+
+    FakeTrajectoryLSHandler.request_counts.clear()
+    collected = usage.collect_usage("conv-root", env=env, timeout=5.0)
+    self.assertEqual(
+        set(collected["conversations"].keys()),
+        {"conv-root", "conv-child-1", "conv-child-2"},
+    )
+    self.assertEqual(collected["totals"]["MODEL_FAKE_B"]["calls"], 3)
+    self.assertEqual(collected["totals"]["MODEL_FAKE_B"]["input_tokens"], 1150)
+    self.assertEqual(collected["totals"]["MODEL_FAKE_B"]["output_tokens"], 350)
+
+    u_path = usage.write_usage(collected, self.app_dir)
+    with open(u_path, "r", encoding="utf-8") as f:
+      raw_disk = f.read()
+    self.assertNotIn("SUPER_SECRET_PROMPT_TEXT_DO_NOT_PERSIST", raw_disk)
+    self.assertNotIn("secret-csrf-token-xyz", raw_disk)
+
+    # Re-collecting within 60s skips non-root child HTTP fetches.
+    FakeTrajectoryLSHandler.request_counts.clear()
+    cached_convs = usage.read_usage(self.app_dir)["conversations"]
+    usage.collect_usage(
+        "conv-root",
+        env=env,
+        timeout=5.0,
+        cached_conversations=cached_convs,
+        min_recheck_seconds=60.0,
+    )
+    self.assertEqual(FakeTrajectoryLSHandler.request_counts.get("conv-root"), 1)
+    self.assertIsNone(FakeTrajectoryLSHandler.request_counts.get("conv-child-1"))
+    self.assertIsNone(FakeTrajectoryLSHandler.request_counts.get("conv-child-2"))
+
+
+class SnapshotLedgerAndDeltaTest(FixtureMixin, unittest.TestCase):
+
+  def setUp(self):
+    self.make_config()
+
+  def test_snapshot_ledger_and_common_conversation_delta(self):
+    s1 = {
+        "ts": "2026-10-07T01:00:00Z",
+        "quota": {
+            "fast-high": {
+                "enum": "MODEL_FAKE_FAST_HIGH",
+                "remaining_fraction": 0.90,
+                "reset_time": "2026-10-07T20:00:00Z",
+                "quota_group": "quota-group-1",
+            }
+        },
+        "conversations": ["c1", "c2"],
+        "by_conversation": {
+            "c1": {
+                "MODEL_FAKE_FAST_HIGH": {
+                    "calls": 2,
+                    "input_tokens": 1000,
+                    "output_tokens": 200,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                }
+            },
+            "c2": {
+                "MODEL_FAKE_FAST_HIGH": {
+                    "calls": 10,
+                    "input_tokens": 9000,
+                    "output_tokens": 900,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                }
+            },
+        },
+        "totals": {
+            "MODEL_FAKE_FAST_HIGH": {
+                "calls": 12,
+                "input_tokens": 10000,
+                "output_tokens": 1100,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            }
+        },
+    }
+    # Snapshot 2 drops c2, adds c3, and advances c1 by +3 calls / +1500 input.
+    s2 = {
+        "ts": "2026-10-07T01:05:00Z",
+        "quota": {
+            "fast-high": {
+                "enum": "MODEL_FAKE_FAST_HIGH",
+                "remaining_fraction": 0.87,
+                "reset_time": "2026-10-07T20:00:00Z",
+                "quota_group": "quota-group-1",
+            }
+        },
+        "conversations": ["c1", "c3"],
+        "by_conversation": {
+            "c1": {
+                "MODEL_FAKE_FAST_HIGH": {
+                    "calls": 5,
+                    "input_tokens": 2500,
+                    "output_tokens": 500,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                }
+            },
+            "c3": {
+                "MODEL_FAKE_FAST_HIGH": {
+                    "calls": 50,
+                    "input_tokens": 80000,
+                    "output_tokens": 4000,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                }
+            },
+        },
+        "totals": {
+            "MODEL_FAKE_FAST_HIGH": {
+                "calls": 55,
+                "input_tokens": 82500,
+                "output_tokens": 4500,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            }
+        },
+    }
+    usage.append_snapshot(s1, self.app_dir)
+    usage.append_snapshot(s2, self.app_dir)
+    loaded = usage.read_snapshots(self.app_dir)
+    self.assertEqual(len(loaded), 2)
+
+    delta = usage.snapshot_delta(loaded[0], loaded[1])
+    self.assertEqual(delta["common_conversations"], ["c1"])
+    self.assertEqual(
+        delta["per_model"]["MODEL_FAKE_FAST_HIGH"],
+        {
+            "calls": 3,
+            "input_tokens": 1500,
+            "output_tokens": 300,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        },
+    )
+
+  def test_append_snapshot_caps_ledger_lines(self):
+    for i in range(8):
+      usage.append_snapshot({"ts": f"T{i}", "seq": i}, self.app_dir, max_lines=5)
+    loaded = usage.read_snapshots(self.app_dir)
+    self.assertEqual([s["seq"] for s in loaded], [3, 4, 5, 6, 7])
+
+
+class BillingInferenceTest(unittest.TestCase):
+
+  def _make_snap(self, rf, rt, calls, inp, out=0, cr=0, cw=0, extra_models=None):
+    quota = {
+        "target-model": {
+            "enum": "MODEL_FAKE_A",
+            "remaining_fraction": rf,
+            "reset_time": rt,
+            "quota_group": "quota-group-1",
+        }
+    }
+    if extra_models:
+      quota.update(extra_models)
+    return {
+        "ts": "2026-10-07T00:00:00Z",
+        "quota": quota,
+        "conversations": ["c1"],
+        "totals": {
+            "MODEL_FAKE_A": {
+                "calls": calls,
+                "input_tokens": inp,
+                "output_tokens": out,
+                "cache_read_tokens": cr,
+                "cache_write_tokens": cw,
+            }
+        },
+    }
+
+  def test_infer_calls_metered(self):
+    # Each call drops remaining_fraction by exactly 0.01 (100 calls per full quota),
+    # while token counts vary wildly per pair.
+    snaps = [
+        self._make_snap(1.00, "T1", 0, 0),
+        self._make_snap(0.99, "T1", 1, 500),
+        self._make_snap(0.97, "T1", 3, 40500),
+        self._make_snap(0.96, "T1", 4, 40600),
+        self._make_snap(0.92, "T1", 8, 41000),
+        self._make_snap(0.90, "T1", 10, 250000),
+    ]
+    res = usage.infer_billing(snaps, "target-model")
+    self.assertEqual(res["unit"], "calls")
+    self.assertEqual(res["confidence"], "high")
+    self.assertEqual(res["samples"], 5)
+    self.assertAlmostEqual(res["fit"]["calls"]["units_per_full_quota"], 100.0)
+    self.assertAlmostEqual(res["fit"]["calls"]["cv"], 0.0)
+    self.assertAlmostEqual(res["calls_per_percent"], 1.0)
+    self.assertTrue(any("not tracked" in c for c in res["caveats"]))
+
+  def test_infer_tokens_metered(self):
+    # Quota drops by 0.01 per 1,000 tokens (100,000 tokens per full quota),
+    # while call counts per pair vary widely.
+    snaps = [
+        self._make_snap(1.00, "T1", 0, 0),
+        self._make_snap(0.99, "T1", 1, 1000),
+        self._make_snap(0.95, "T1", 10, 5000),
+        self._make_snap(0.93, "T1", 11, 7000),
+        self._make_snap(0.85, "T1", 12, 15000),
+        self._make_snap(0.80, "T1", 25, 20000),
+    ]
+    res = usage.infer_billing(snaps, "target-model")
+    self.assertEqual(res["unit"], "tokens")
+    self.assertEqual(res["confidence"], "high")
+    self.assertEqual(res["samples"], 5)
+    self.assertAlmostEqual(
+        res["fit"]["tokens_total"]["units_per_full_quota"], 100000.0
+    )
+    self.assertAlmostEqual(res["tokens_per_percent"], 1000.0)
+
+  def test_reset_boundary_and_zero_drop_and_insufficient_samples(self):
+    snaps = [
+        self._make_snap(0.50, "T1", 1, 1000),
+        self._make_snap(0.49, "T1", 2, 2000),
+        # Reset boundary: reset_time changes T1 -> T2 and quota jumps to 1.0
+        self._make_snap(1.00, "T2", 5, 5000),
+        # Zero quota drop despite positive usage
+        self._make_snap(1.00, "T2", 7, 8000),
+        self._make_snap(0.99, "T2", 8, 9000),
+    ]
+    res = usage.infer_billing(snaps, "target-model", min_pairs=3)
+    self.assertIsNone(res["unit"])
+    self.assertEqual(res["confidence"], "insufficient")
+    self.assertEqual(res["samples"], 2)
+    self.assertEqual(res["skipped_reset_pairs"], 1)
+    self.assertEqual(res["zero_drop_samples"], 1)
+    self.assertTrue(any("zero measured quota drop" in c for c in res["caveats"]))
+
+  def _make_group_snap(self, rf, calls_a, tok_a, calls_b, tok_b):
+    return {
+        "ts": "2026-10-07T00:00:00Z",
+        "quota": {
+            "fast-high": {
+                "enum": "MODEL_FAKE_A",
+                "remaining_fraction": rf,
+                "reset_time": "T1",
+                "quota_group": "quota-group-1",
+            },
+            "fast-low": {
+                "enum": "MODEL_FAKE_B",
+                "remaining_fraction": rf,
+                "reset_time": "T1",
+                "quota_group": "quota-group-1",
+            },
+        },
+        "conversations": ["c1"],
+        "totals": {
+            "MODEL_FAKE_A": {
+                "calls": calls_a,
+                "input_tokens": tok_a,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+            "MODEL_FAKE_B": {
+                "calls": calls_b,
+                "input_tokens": tok_b,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+        },
+    }
+
+  def test_quota_group_aggregation(self):
+    # Two models share quota-group-1 (100 calls per full quota).
+    # Pair 1 uses MODEL_FAKE_A (2 calls -> 0.02 drop).
+    # Pair 2 uses MODEL_FAKE_B (3 calls -> 0.03 drop).
+    # Pair 3 uses both (1 + 4 = 5 calls -> 0.05 drop).
+    snaps = [
+        self._make_group_snap(1.00, 0, 0, 0, 0),
+        self._make_group_snap(0.98, 2, 500, 0, 0),
+        self._make_group_snap(0.95, 2, 500, 3, 90000),
+        self._make_group_snap(0.90, 3, 700, 7, 90500),
+    ]
+    res = usage.infer_billing(snaps, "fast-high", min_pairs=3)
+    self.assertEqual(res["unit"], "calls")
+    self.assertIn(res["confidence"], ("medium", "high"))
+    self.assertEqual(res["models"], ["fast-high", "fast-low"])
+    self.assertAlmostEqual(res["fit"]["calls"]["cv"], 0.0)
+
+
+class InferBillingApplyAndQuotaSourceTest(FixtureMixin, unittest.TestCase):
+
+  def setUp(self):
+    # Configure subagent as a custom model with enum but unknown billing.
+    self.make_config(
+        subagent="mystery-sub",
+        custom_models={
+            "mystery-sub": {
+                "enum": "MODEL_FAKE_MYSTERY",
+                "label": "Mystery Subagent",
+                "billing": {"unit": "unknown", "bucket": "M"},
+            }
+        },
+    )
+
+  def _write_call_metered_snapshots_for(self, model_id, enum, bucket="G1"):
+    rows = [
+        (1.00, 0, 0),
+        (0.98, 2, 400),
+        (0.95, 5, 50000),
+        (0.94, 6, 50200),
+        (0.90, 10, 51000),
+        (0.85, 15, 250000),
+    ]
+    for rf, calls, inp in rows:
+      usage.append_snapshot(
+          {
+              "ts": "2026-10-07T02:00:00Z",
+              "quota": {
+                  model_id: {
+                      "enum": enum,
+                      "remaining_fraction": rf,
+                      "reset_time": "2026-10-07T20:00:00Z",
+                      "quota_group": bucket,
+                  }
+              },
+              "conversations": ["c1"],
+              "totals": {
+                  enum: {
+                      "calls": calls,
+                      "input_tokens": inp,
+                      "output_tokens": 100,
+                      "cache_read_tokens": 0,
+                      "cache_write_tokens": 0,
+                  }
+              },
+          },
+          self.app_dir,
+      )
+
+  def test_infer_billing_apply_updates_unknown_and_skips_manual(self):
+    # Before inference: mystery-sub has unknown billing.
+    active_before = tc.load_active()
+    self.assertEqual(
+        active_before["roles"]["worker"]["billing"]["unit"], "unknown"
+    )
+    self.assertTrue(
+        any(
+            "Billing for mystery-sub is unknown" in f["message"]
+            for f in active_before["economics"]["findings"]
+        )
+    )
+
+    self._write_call_metered_snapshots_for(
+        "mystery-sub", "MODEL_FAKE_MYSTERY", bucket="M"
+    )
+    err, body = self.call(
+        "infer_billing", {"model_id": "mystery-sub", "apply": True}
+    )
+    self.assertFalse(err, body)
+    self.assertEqual(body["unit"], "calls")
+    self.assertEqual(body["confidence"], "high")
+    self.assertEqual(body["applied"], ["mystery-sub"])
+
+    # Now mystery-sub has inferred call-metered billing and a warn finding.
+    active_after = tc.load_active()
+    worker_b = active_after["roles"]["worker"]["billing"]
+    self.assertEqual(worker_b["unit"], "calls")
+    self.assertEqual(worker_b["bucket"], "M")
+    self.assertEqual(worker_b["inferred"]["confidence"], "high")
+    self.assertEqual(worker_b["inferred"]["samples"], 5)
+    messages = [f["message"] for f in active_after["economics"]["findings"]]
+    self.assertTrue(
+        any(
+            "billing for mystery-sub inferred from 5 samples (confidence high)"
+            in m
+            for m in messages
+        ),
+        messages,
+    )
+    self.assertTrue(any("Offload:" in m for m in messages), messages)
+
+    # Manual billing on big-tokens (in models.json) is never overwritten.
+    self._write_call_metered_snapshots_for(
+        "big-tokens", "MODEL_FAKE_BIG_TOKENS", bucket="T"
+    )
+    err, body2 = self.call(
+        "infer_billing", {"model_id": "big-tokens", "apply": True}
+    )
+    self.assertFalse(err, body2)
+    self.assertEqual(body2["applied"], [])
+    self.assertEqual(body2["skipped"][0]["model_id"], "big-tokens")
+    self.assertEqual(
+        tc.load_active()["roles"]["orchestrator"]["billing"]["unit"], "tokens"
+    )
+
+  def test_quota_and_cache_status_measured_vs_estimate(self):
+    # Without usage.json -> source is "estimate".
+    err, q_est = self.call("get_quota_status")
+    self.assertFalse(err, q_est)
+    self.assertEqual(q_est["source"], "estimate")
+    self.assertIsNone(q_est["cache_age_seconds"])
+
+    err, c_est = self.call("get_cache_status", {"conversation_id": "conv-1"})
+    self.assertFalse(err, c_est)
+    self.assertEqual(c_est["source"], "estimate")
+    self.assertTrue(c_est["estimate"])
+
+    # Write measured usage to usage.json -> source becomes "measured".
+    now_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    usage.write_usage(
+        {
+            "updated_at": now_iso,
+            "conversations": {
+                "conv-1": {
+                    "conversation_id": "conv-1",
+                    "fetched_at": now_iso,
+                    "per_model": {
+                        "MODEL_FAKE_BIG_TOKENS": {
+                            "calls": 4,
+                            "input_tokens": 2000,
+                            "output_tokens": 800,
+                            "cache_read_tokens": 18000,
+                            "cache_write_tokens": 500,
+                        }
+                    },
+                    "child_conversation_ids": [],
+                }
+            },
+        },
+        self.app_dir,
+    )
+
+    err, q_meas = self.call("get_quota_status", {"conversation_id": "conv-1"})
+    self.assertFalse(err, q_meas)
+    self.assertEqual(q_meas["source"], "measured")
+    self.assertIsNotNone(q_meas["cache_age_seconds"])
+    self.assertEqual(q_meas["totals"]["calls"], 4)
+    self.assertEqual(q_meas["totals"]["cache_read_tokens"], 18000)
+    self.assertEqual(
+        q_meas["orchestrator"]["measured_usage"]["input_tokens"], 2000
+    )
+
+    err, c_meas = self.call("get_cache_status", {"conversation_id": "conv-1"})
+    self.assertFalse(err, c_meas)
+    self.assertEqual(c_meas["source"], "measured")
+    self.assertFalse(c_meas["estimate"])
+    self.assertEqual(c_meas["calls"], 4)
+    self.assertEqual(c_meas["cache_read_tokens"], 18000)
+    self.assertIsNotNone(c_meas["cache_age_seconds"])
+
+    err, m_cfg = self.call("get_model_config")
+    self.assertFalse(err, m_cfg)
+    self.assertEqual(m_cfg["usage"]["tracked_conversations"], 1)
+    self.assertIsNotNone(m_cfg["usage"]["cache_age_seconds"])
+
+  def test_corrupt_cache_files_do_not_crash_tools(self):
+    u_path = usage.usage_cache_path(self.app_dir)
+    s_path = usage.snapshots_path(self.app_dir)
+    c_path = catalog.catalog_cache_path(self.app_dir)
+    os.makedirs(os.path.dirname(u_path), exist_ok=True)
+    with open(u_path, "w", encoding="utf-8") as f:
+      f.write("{corrupt-json")
+    with open(s_path, "w", encoding="utf-8") as f:
+      f.write("{bad-line\nnot-a-dict\n")
+    with open(c_path, "w", encoding="utf-8") as f:
+      f.write("{corrupt-catalog")
+
+    for tool_name, args in (
+        ("get_quota_status", {}),
+        ("get_cache_status", {"conversation_id": "conv-1"}),
+        ("get_model_config", {}),
+        ("infer_billing", {}),
+        ("list_models", {}),
+    ):
+      err, body = self.call(tool_name, args)
+      self.assertFalse(err, f"{tool_name} failed on corrupt cache: {body}")
 
 
 if __name__ == "__main__":

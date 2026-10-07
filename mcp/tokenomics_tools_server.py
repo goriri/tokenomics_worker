@@ -15,9 +15,12 @@ Tools:
 - set_model_info: Records label and billing info for a model in custom_models
   without requiring an enum.
 - route_models: Returns active routing decisions (primary vs fallback).
-- get_quota_status: Quota buckets, limits and cost rules for the configured
-  models.
-- get_cache_status: Prompt cache state, TTL expiry and cost for a conversation.
+- infer_billing: Infers a model's billing unit (calls vs tokens) from snapshot
+  pairs and optionally writes it into custom_models.
+- get_quota_status: Quota buckets, limits, cost rules and measured usage for
+  the configured models.
+- get_cache_status: Prompt cache state, TTL expiry and measured cache hit rate
+  for a conversation.
 - detect_test_tampering: Audits test diffs for deleted assertions or
   suppressions.
 - record_orchestration_event: Appends a usage event to the local ledger.
@@ -39,9 +42,10 @@ from typing import Any, Callable, TextIO
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib")
 )
-import render
 import catalog
+import render
 import tokenomics_config as tc
+import usage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,8 +146,40 @@ def _enum_to_ids(registry: dict[str, Any], enum: str | None) -> list[str]:
   return sorted(m for m, info in registry.items() if enum and info.get("enum") == enum)
 
 
-def _role_view(active: dict[str, Any], role: str) -> dict[str, Any]:
+def _billing_inference_summary(
+    info: dict[str, Any], snapshots: list[dict[str, Any]] | None
+) -> dict[str, Any] | None:
+  """Builds a compact billing inference summary for a resolved model."""
+  inferred_cfg = (info.get("billing") or {}).get("inferred")
+  if snapshots:
+    inf = usage.infer_billing(snapshots, info["model_id"])
+    if inf.get("samples", 0) > 0 or inf.get("zero_drop_samples", 0) > 0:
+      return {
+          "unit": inf["unit"],
+          "confidence": inf["confidence"],
+          "samples": inf["samples"],
+          "method": inf.get("method"),
+          "applied": isinstance(inferred_cfg, dict),
+      }
+  if isinstance(inferred_cfg, dict):
+    return {
+        "unit": (info.get("billing") or {}).get("unit"),
+        "confidence": inferred_cfg.get("confidence"),
+        "samples": inferred_cfg.get("samples"),
+        "method": inferred_cfg.get("method"),
+        "inferred_at": inferred_cfg.get("inferred_at"),
+        "applied": True,
+    }
+  return None
+
+
+def _role_view(
+    active: dict[str, Any],
+    role: str,
+    snapshots: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
   info = active["roles"][role]
+  inf_summary = _billing_inference_summary(info, snapshots)
   view: dict[str, Any] = {
       "type_name": active["agents"][role],
       "model_id": info["model_id"],
@@ -152,6 +188,7 @@ def _role_view(active: dict[str, Any], role: str) -> dict[str, Any]:
       "enum": info["enum"],
       "enum_source": info.get("enum_source"),
       "billing": info["billing"],
+      "billing_inference": inf_summary,
       "alias": info.get("alias", False),
       "notes": info.get("notes", ""),
   }
@@ -164,6 +201,7 @@ def _role_view(active: dict[str, Any], role: str) -> dict[str, Any]:
         "enum": fb["enum"],
         "enum_source": fb.get("enum_source"),
         "billing": fb["billing"],
+        "billing_inference": _billing_inference_summary(fb, snapshots),
         "alias": fb.get("alias", False),
         "notes": fb.get("notes", ""),
     }
@@ -185,6 +223,15 @@ def get_model_config(conversation_id: str | None = None) -> dict[str, Any]:
         "age_seconds": round(age, 1) if age is not None else None,
         "stale": catalog.is_catalog_stale(cat),
     }
+
+  u_data = usage.read_usage()
+  snaps = usage.read_snapshots()
+  u_age = usage.usage_age_seconds(u_data, conversation_id=conversation_id)
+  usage_view = {
+      "cache_age_seconds": round(u_age, 1) if u_age is not None else None,
+      "snapshots": len(snaps),
+      "tracked_conversations": len((u_data or {}).get("conversations") or {}),
+  }
 
   names = dict(tc.AGENT_NAMES)
   fallback_names = {
@@ -209,18 +256,32 @@ def get_model_config(conversation_id: str | None = None) -> dict[str, Any]:
       active, cat, names=names, fallback_names=fallback_names
   )
 
+  orch_view = _role_view(active, "orchestrator", snapshots=snaps)
+  sub_views = {
+      r: _role_view(active, r, snapshots=snaps) for r in tc.SUBAGENT_ROLES
+  }
+  role_inferences: dict[str, Any] = {}
+  if orch_view.get("billing_inference") is not None:
+    role_inferences["orchestrator"] = orch_view["billing_inference"]
+  for r, sv in sub_views.items():
+    if sv.get("billing_inference") is not None:
+      role_inferences[r] = sv["billing_inference"]
+
   result: dict[str, Any] = {
       "catalog": cat_view,
+      "usage": usage_view,
       "routing": routing,
       "plugin_defaults": {
-          "orchestrator": _role_view(active, "orchestrator"),
-          "subagents": {r: _role_view(active, r) for r in tc.SUBAGENT_ROLES},
+          "orchestrator": orch_view,
+          "subagents": sub_views,
+          "billing_inference": role_inferences,
           "mode": active["economics"]["mode"],
           "pairing_verdict": active["economics"]["mode"],
           "findings": active["economics"]["findings"],
           "orchestrator_cost_rules": active["economics"]["orchestrator"]["summary"],
           "orchestrator_cost_rules_summary": active["economics"]["orchestrator"]["summary"],
       },
+      "billing_inference": role_inferences,
       "how_to_change": (
           "Call set_models (session pins, immediate) or set_models with"
           " persist=true (new plugin defaults, after restart). The"
@@ -253,19 +314,82 @@ def get_model_config(conversation_id: str | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------- quota status
 
 
-def get_quota_status(role: str | None = None) -> dict[str, Any]:
-  """Returns quota buckets and cost rules for the configured models."""
+def get_quota_status(
+    role: str | None = None, conversation_id: str | None = None
+) -> dict[str, Any]:
+  """Returns quota buckets, cost rules, and measured usage when available."""
   active = _active()
   which = (role or "all").strip().lower()
   if which not in ("all", "orchestrator", "subagents"):
     raise ValueError("role must be 'orchestrator', 'subagents' or 'all'")
 
+  u_data = usage.read_usage()
+  convs = (u_data or {}).get("conversations") or {}
+  clean_cid = sanitize_ident(conversation_id) if conversation_id else ""
+
+  has_measured = False
+  target_cids: list[str] = []
+  per_model_measured: dict[str, dict[str, int]] = {}
+  age_seconds: float | None = None
+
+  if clean_cid:
+    if clean_cid in convs:
+      has_measured = True
+      target_cids = [clean_cid]
+      for ch in convs[clean_cid].get("child_conversation_ids") or []:
+        if ch in convs and ch not in target_cids:
+          target_cids.append(ch)
+      per_model_measured = usage.sum_conversations_usage(convs, target_cids)
+      age_seconds = usage.usage_age_seconds(u_data, clean_cid)
+  elif u_data and (convs or isinstance(u_data.get("totals"), dict)):
+    has_measured = True
+    target_cids = list(convs.keys())
+    raw_totals = u_data.get("totals")
+    per_model_measured = (
+        raw_totals
+        if isinstance(raw_totals, dict) and raw_totals
+        else usage.sum_conversations_usage(convs)
+    )
+    age_seconds = usage.usage_age_seconds(u_data)
+
+  age_val = round(age_seconds, 1) if age_seconds is not None else None
+  total_measured = usage._empty_counters()
+  for counts in per_model_measured.values():
+    if isinstance(counts, dict):
+      for k in usage._COUNTER_KEYS:
+        total_measured[k] += usage._parse_nonneg_int(counts.get(k, 0))
+
   result: dict[str, Any] = {
-      "note": "Quota limits and cost rules are estimates based on configured model definitions."
+      "source": "measured" if has_measured else "estimate",
+      "cache_age_seconds": age_val if has_measured else None,
+      "usage_cache_age_seconds": age_val if has_measured else None,
+      "note": (
+          "Measured token usage from cached GetCascadeTrajectory data; quota"
+          " limits and cost rules come from configured model definitions."
+          if has_measured
+          else (
+              "Quota limits and cost rules are estimates based on configured"
+              " model definitions."
+          )
+      ),
   }
+  if has_measured:
+    result["per_model"] = per_model_measured
+    result["totals"] = total_measured
+    result["measured_usage"] = {
+        "per_model": per_model_measured,
+        "totals": total_measured,
+        "tracked_conversations": len(target_cids),
+        "cache_age_seconds": age_val,
+    }
+
   if which in ("all", "orchestrator"):
     view = _role_view(active, "orchestrator")
     view["cost_rules"] = active["economics"]["orchestrator"]["summary"]
+    if has_measured and view.get("enum"):
+      view["measured_usage"] = per_model_measured.get(
+          view["enum"], usage._empty_counters()
+      )
     result["orchestrator"] = view
   if which in ("all", "subagents"):
     # Collapse roles that share a model so the answer stays short.
@@ -276,6 +400,10 @@ def get_quota_status(role: str | None = None) -> dict[str, Any]:
           view["model_id"],
           {k: v for k, v in view.items() if k != "type_name"},
       )
+      if has_measured and entry.get("enum") and "measured_usage" not in entry:
+        entry["measured_usage"] = per_model_measured.get(
+            entry["enum"], usage._empty_counters()
+        )
       entry.setdefault("type_names", []).append(view["type_name"])
     result["subagents"] = list(by_model.values())
   if which == "all":
@@ -308,6 +436,8 @@ def list_models(name_filter: str | None = None) -> dict[str, Any]:
 
   if cat:
     for cm in cat.get("models") or []:
+      if not isinstance(cm, dict):
+        continue
       mid = cm.get("model_id")
       if not mid:
         continue
@@ -320,7 +450,10 @@ def list_models(name_filter: str | None = None) -> dict[str, Any]:
         continue
       reg_info = registry.get(mid, {})
       rf = cm.get("remaining_fraction")
-      quota_str = f"{int(round(rf * 100))}%" if rf is not None else "-"
+      if isinstance(rf, (int, float)) and not isinstance(rf, bool):
+        quota_str = f"{int(round(rf * 100))}%"
+      else:
+        quota_str = "-"
       models.append({
           "model_id": mid,
           "label": cm.get("label") or mid,
@@ -630,6 +763,129 @@ def set_model_info_tool(args: dict[str, Any]) -> dict[str, Any]:
   )
 
 
+def infer_billing_tool(args: dict[str, Any]) -> dict[str, Any]:
+  """Infers billing unit from snapshot pairs and optionally writes custom_models."""
+  snapshots = usage.read_snapshots()
+  config = tc.load_config()
+  cat = catalog.read_catalog()
+  registry = tc.load_registry(config, catalog=cat)
+
+  raw_mid = (args.get("model_id") or "").strip()
+  apply_flag = bool(args.get("apply", False))
+  min_pairs = sanitize_int(args.get("min_pairs", 3), minimum=1)
+
+  results: dict[str, dict[str, Any]] = {}
+  if raw_mid:
+    try:
+      target_id = _normalize_arg(raw_mid, registry)
+    except tc.ConfigError:
+      target_id = raw_mid
+    results[target_id] = usage.infer_billing(
+        snapshots, target_id, min_pairs=min_pairs
+    )
+  else:
+    candidates: list[str] = []
+    for snap in snapshots:
+      q = snap.get("quota")
+      if isinstance(q, dict):
+        for k in q:
+          if isinstance(k, str) and k not in candidates:
+            candidates.append(k)
+    if cat and isinstance(cat.get("models"), list):
+      for m in cat["models"]:
+        mid = m.get("model_id") if isinstance(m, dict) else None
+        if isinstance(mid, str) and mid not in candidates:
+          candidates.append(mid)
+    for mid in tc.role_model_ids(config).values():
+      if mid and mid not in candidates:
+        candidates.append(mid)
+
+    all_inferences: dict[str, dict[str, Any]] = {}
+    with_samples: dict[str, dict[str, Any]] = {}
+    for mid in candidates:
+      inf = usage.infer_billing(snapshots, mid, min_pairs=min_pairs)
+      all_inferences[mid] = inf
+      if inf.get("samples", 0) > 0 or inf.get("zero_drop_samples", 0) > 0:
+        with_samples[mid] = inf
+    results = with_samples if with_samples else all_inferences
+
+  applied: list[str] = []
+  skipped: list[dict[str, str]] = []
+  if apply_flag:
+    now_iso = get_current_time().strftime("%Y-%m-%dT%H:%M:%SZ")
+    for mid, inf in results.items():
+      target_mids = (
+          inf.get("models")
+          if (mid not in registry and inf.get("models"))
+          else [mid]
+      )
+      for t_mid in target_mids:
+        conf = inf.get("confidence")
+        unit = inf.get("unit")
+        if conf not in ("high", "medium") or unit not in (
+            tc.UNIT_CALLS,
+            tc.UNIT_TOKENS,
+        ):
+          skipped.append({
+              "model_id": t_mid,
+              "reason": (
+                  f"confidence is {conf!r} (requires 'high' or 'medium' to"
+                  " apply)"
+              ),
+          })
+          continue
+        inferred_meta = {
+            "confidence": conf,
+            "samples": inf.get("samples", 0),
+            "method": inf.get("method") or unit,
+            "inferred_at": now_iso,
+        }
+        billing_payload: dict[str, Any] = {
+            "unit": unit,
+            "inferred": inferred_meta,
+        }
+        if inf.get("quota_group"):
+          billing_payload["bucket"] = inf["quota_group"]
+          billing_payload["bucket_inferred"] = True
+        set_res = tc.set_model_info(model_id=t_mid, billing=billing_payload)
+        if set_res.get("skipped"):
+          skipped.append({
+              "model_id": t_mid,
+              "reason": str(
+                  set_res.get(
+                      "reason", "manual billing already set; never overwritten"
+                  )
+              ),
+          })
+        else:
+          applied.append(t_mid)
+
+  active = _active()
+  out: dict[str, Any] = {
+      "snapshots_count": len(snapshots),
+      "results": results,
+      "applied": applied,
+      "skipped": skipped,
+      "pairing_verdict": active["economics"]["mode"],
+      "findings": active["economics"]["findings"],
+  }
+  if len(results) == 1:
+    single = next(iter(results.values()))
+    for k in (
+        "unit",
+        "method",
+        "confidence",
+        "samples",
+        "zero_drop_samples",
+        "fit",
+        "calls_per_percent",
+        "tokens_per_percent",
+        "caveats",
+    ):
+      out[k] = single.get(k)
+  return out
+
+
 def learn_model_tool(args: dict[str, Any]) -> dict[str, Any]:
   """Records model_id -> enum from a conversation running that model."""
   learned = tc.learn_model(
@@ -702,12 +958,48 @@ def get_cache_status(conversation_id: str) -> dict[str, Any]:
   ttl = int(billing.get("cache_ttl_seconds") or DEFAULT_CACHE_TTL_SECONDS)
   quota_relevant = billing.get("unit") != "calls"
   clean_id = sanitize_ident(conversation_id)
-  base = {
+
+  u_data = usage.read_usage()
+  convs = (u_data or {}).get("conversations") or {}
+  conv_usage = convs.get(clean_id) if clean_id else None
+  has_measured = isinstance(conv_usage, dict)
+  age_sec = (
+      usage.usage_age_seconds(u_data, clean_id) if has_measured else None
+  )
+  age_val = round(age_sec, 1) if age_sec is not None else None
+
+  measured_totals = usage._empty_counters()
+  per_model_map: dict[str, Any] = {}
+  if has_measured and isinstance(conv_usage, dict):
+    raw_pm = conv_usage.get("per_model")
+    per_model_map = raw_pm if isinstance(raw_pm, dict) else {}
+    for counts in per_model_map.values():
+      if isinstance(counts, dict):
+        for k in usage._COUNTER_KEYS:
+          measured_totals[k] += usage._parse_nonneg_int(counts.get(k, 0))
+
+  base: dict[str, Any] = {
       "orchestrator_model": orch["model_id"],
       "cache_ttl_seconds": ttl,
       "affects_quota": quota_relevant,
-      "estimate": True,
+      "source": "measured" if has_measured else "estimate",
+      "estimate": not has_measured,
+      "cache_age_seconds": age_val,
+      "usage_cache_age_seconds": age_val,
   }
+  if has_measured:
+    base["per_model"] = per_model_map
+    base["calls"] = measured_totals["calls"]
+    base["input_tokens"] = measured_totals["input_tokens"]
+    base["output_tokens"] = measured_totals["output_tokens"]
+    base["cache_read_tokens"] = measured_totals["cache_read_tokens"]
+    base["cache_write_tokens"] = measured_totals["cache_write_tokens"]
+    base["measured_usage"] = {
+        **measured_totals,
+        "per_model": per_model_map,
+        "cache_age_seconds": age_val,
+    }
+
   if not clean_id:
     return {
         **base,
@@ -716,26 +1008,40 @@ def get_cache_status(conversation_id: str) -> dict[str, Any]:
     }
 
   hit_pct: float | None = None
-  ledger_path = get_telemetry_file()
-  if os.path.exists(ledger_path):
-    try:
-      with open(ledger_path, "r", encoding="utf-8") as f:
-        for line in reversed(f.readlines()):
-          line = line.strip()
-          if not line:
-            continue
-          try:
-            ev = json.loads(line)
-            if ev.get("session_id") == clean_id:
-              if "cache_hit_rate" in ev:
-                hit_pct = float(ev["cache_hit_rate"])
-              break
-          except (ValueError, TypeError):
-            continue
-    except OSError:
-      pass
+  if has_measured:
+    denom = (
+        measured_totals["input_tokens"]
+        + measured_totals["cache_read_tokens"]
+        + measured_totals["cache_write_tokens"]
+    )
+    if denom > 0:
+      hit_pct = round(
+          100.0 * measured_totals["cache_read_tokens"] / denom, 2
+      )
+
+  if hit_pct is None:
+    ledger_path = get_telemetry_file()
+    if os.path.exists(ledger_path):
+      try:
+        with open(ledger_path, "r", encoding="utf-8") as f:
+          for line in reversed(f.readlines()):
+            line = line.strip()
+            if not line:
+              continue
+            try:
+              ev = json.loads(line)
+              if ev.get("session_id") == clean_id:
+                if "cache_hit_rate" in ev:
+                  hit_pct = float(ev["cache_hit_rate"])
+                break
+            except (ValueError, TypeError):
+              continue
+      except OSError:
+        pass
 
   last = get_last_turn_timestamp(clean_id)
+  if last is None and has_measured and isinstance(conv_usage, dict):
+    last = catalog._parse_iso_utc(str(conv_usage.get("fetched_at") or ""))
   if last is None:
     return {
         **base,
@@ -1156,10 +1462,46 @@ def list_tools() -> list[dict[str, Any]]:
           },
       },
       {
+          "name": "infer_billing",
+          "description": (
+              "Empirically infers whether a model or quota group is"
+              " call-metered or token-metered from usage_snapshots.jsonl pairs."
+              " With apply=true and high or medium confidence, writes inferred"
+              " billing into custom_models without overwriting manual billing."
+          ),
+          "inputSchema": {
+              "type": "object",
+              "properties": {
+                  "model_id": {
+                      "type": "string",
+                      "description": (
+                          "Optional model id or quota group to inspect; omit to"
+                          " inspect every catalog model with snapshot samples."
+                      ),
+                  },
+                  "apply": {
+                      "type": "boolean",
+                      "description": (
+                          "When true and confidence is high or medium, saves"
+                          " inferred billing into custom_models."
+                      ),
+                  },
+                  "min_pairs": {
+                      "type": "integer",
+                      "description": (
+                          "Minimum positive-drop snapshot pairs required"
+                          " (default 3)."
+                      ),
+                  },
+              },
+          },
+      },
+      {
           "name": "get_quota_status",
           "description": (
-              "Returns quota buckets, daily limits and cost rules for the"
-              " configured orchestrator and subagent models."
+              "Returns quota buckets, daily limits, cost rules, and measured"
+              " token/call usage (from usage.json when available, otherwise"
+              " estimates) for the configured orchestrator and subagent models."
           ),
           "inputSchema": {
               "type": "object",
@@ -1168,13 +1510,18 @@ def list_tools() -> list[dict[str, Any]]:
                       "type": "string",
                       "description": "'orchestrator', 'subagents' or 'all'.",
                   },
+                  "conversation_id": {
+                      "type": "string",
+                      "description": "Optional conversation UUID to scope measured usage.",
+                  },
               },
           },
       },
       {
           "name": "get_cache_status",
           "description": (
-              "Inspects prompt cache state for a conversation against the"
+              "Inspects prompt cache state and measured cache read/write tokens"
+              " (when usage.json is available) for a conversation against the"
               " configured orchestrator's cache TTL, and says whether cache"
               " state affects quota for that model."
           ),
@@ -1272,7 +1619,10 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "learn_model": learn_model_tool,
     "set_model_info": set_model_info_tool,
     "route_models": route_models,
-    "get_quota_status": lambda a: get_quota_status(a.get("role")),
+    "infer_billing": infer_billing_tool,
+    "get_quota_status": lambda a: get_quota_status(
+        a.get("role"), a.get("conversation_id")
+    ),
     "get_cache_status": lambda a: get_cache_status(a.get("conversation_id", "")),
     "detect_test_tampering": lambda a: detect_test_tampering(
         a.get("workspace_dir", ""), a.get("base_revision")
