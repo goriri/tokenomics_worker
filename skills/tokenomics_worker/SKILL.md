@@ -432,12 +432,15 @@ unit (`calls` vs `tokens`). When a model's billing unit is `unknown`:
 1.  **Accumulate samples:** Each run of `python3 {plugin}/scripts/model_catalog.py`
     records a quota-and-usage snapshot in `usage_snapshots.jsonl` (pass
     `--conversation <id>` to include additional conversations, or `--no-usage`
-    to skip). Run it before and after workloads that exercise the target model
-    so at least 3–5 consecutive positive-usage pairs accumulate within the same
-    `reset_time` window.
+    to skip). Because `remaining_fraction` updates with lag, `infer_billing`
+    accumulates usage deltas across consecutive snapshots into a segment until
+    quota drops by at least `min_drop` (default `0.002`), discarding open
+    segments when quota rises or a previous `reset_time` passes (rolling
+    `reset_time` values that have not passed are allowed). Run snapshots across
+    workloads until at least 3–5 completed drop segments accumulate.
 2.  **Inspect and apply:** Call `infer_billing` (optionally with `model_id`).
-    Once confidence is `medium` (>= 3 pairs, CV < 0.5) or `high` (>= 5 pairs,
-    CV < 0.25 and > 2x separation against the competing unit), call
+    Once confidence is `medium` (>= 3 samples, CV < 0.5) or `high` (>= 5
+    samples, CV < 0.25 and > 2x separation against the competing unit), call
     `infer_billing` with `apply: true` to record `billing.inferred` in
     `custom_models`. Manual billing set via `set_model_info` always wins and is
     never overwritten.

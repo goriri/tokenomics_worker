@@ -1498,7 +1498,18 @@ class SnapshotLedgerAndDeltaTest(FixtureMixin, unittest.TestCase):
 
 class BillingInferenceTest(unittest.TestCase):
 
-  def _make_snap(self, rf, rt, calls, inp, out=0, cr=0, cw=0, extra_models=None):
+  def _make_snap(
+      self,
+      rf,
+      rt,
+      calls,
+      inp,
+      out=0,
+      cr=0,
+      cw=0,
+      extra_models=None,
+      ts="2026-10-07T00:00:00Z",
+  ):
     quota = {
         "target-model": {
             "enum": "MODEL_FAKE_A",
@@ -1510,7 +1521,7 @@ class BillingInferenceTest(unittest.TestCase):
     if extra_models:
       quota.update(extra_models)
     return {
-        "ts": "2026-10-07T00:00:00Z",
+        "ts": ts,
         "quota": quota,
         "conversations": ["c1"],
         "totals": {
@@ -1539,6 +1550,10 @@ class BillingInferenceTest(unittest.TestCase):
     self.assertEqual(res["unit"], "calls")
     self.assertEqual(res["confidence"], "high")
     self.assertEqual(res["samples"], 5)
+    self.assertEqual(
+        res["pending_usage"],
+        {"calls": 0, "tokens_total": 0, "tokens_uncached": 0},
+    )
     self.assertAlmostEqual(res["fit"]["calls"]["units_per_full_quota"], 100.0)
     self.assertAlmostEqual(res["fit"]["calls"]["cv"], 0.0)
     self.assertAlmostEqual(res["calls_per_percent"], 1.0)
@@ -1564,13 +1579,70 @@ class BillingInferenceTest(unittest.TestCase):
     )
     self.assertAlmostEqual(res["tokens_per_percent"], 1000.0)
 
+  def test_quota_lag_accumulates_segment_and_tracks_pending(self):
+    # Usage spread over 3 snapshots with lagged quota drop (plus sub-min_drop
+    # quantization step) yields 1 sample with summed usage (5 calls, 7500 tokens,
+    # total drop 0.05 -> 100 calls / full quota). Trailing usage stays pending.
+    snaps = [
+        self._make_snap(1.000, "T1", 0, 0),
+        self._make_snap(1.000, "T1", 2, 2000),   # +2 calls, drop 0
+        self._make_snap(0.999, "T1", 4, 5000),   # +2 calls, drop 0.001 (< min_drop)
+        self._make_snap(0.950, "T1", 5, 7500),   # +1 call, total drop 0.050 -> closes
+        self._make_snap(0.950, "T1", 8, 12000),  # +3 calls, drop 0 -> pending
+    ]
+    res = usage.infer_billing(snaps, "target-model", min_pairs=3)
+    self.assertEqual(res["samples"], 1)
+    self.assertEqual(res["zero_drop_samples"], 2)
+    self.assertAlmostEqual(res["fit"]["calls"]["units_per_full_quota"], 100.0)
+    self.assertAlmostEqual(
+        res["fit"]["tokens_total"]["units_per_full_quota"], 150000.0
+    )
+    self.assertEqual(
+        res["pending_usage"],
+        {"calls": 3, "tokens_total": 4500, "tokens_uncached": 4500},
+    )
+
+  def test_drifting_reset_time_allowed_and_reset_discards_open_segment(self):
+    # Rolling reset_time (still in the future relative to ts) does NOT trigger a
+    # reset; once reset_time <= later ts or remaining_fraction rises, open
+    # pending usage is discarded and not merged into the post-reset sample.
+    snaps = [
+        self._make_snap(
+            1.00, "2026-10-08T00:00:00Z", 0, 0, ts="2026-10-07T01:00:00Z"
+        ),
+        self._make_snap(
+            0.98, "2026-10-08T00:05:00Z", 2, 1000, ts="2026-10-07T01:05:00Z"
+        ),
+        self._make_snap(
+            0.95, "2026-10-08T00:10:00Z", 5, 80000, ts="2026-10-07T01:10:00Z"
+        ),
+        # Pending usage (+4 calls) before reset_time passes:
+        self._make_snap(
+            0.95, "2026-10-07T02:00:00Z", 9, 90000, ts="2026-10-07T01:50:00Z"
+        ),
+        # Later ts (02:05) is >= previous reset_time (02:00) -> reset! Discards +4 calls.
+        self._make_snap(
+            0.95, "2026-10-08T02:00:00Z", 12, 95000, ts="2026-10-07T02:05:00Z"
+        ),
+        # Post-reset segment: +3 calls (12 -> 15) and 0.03 drop (0.95 -> 0.92).
+        self._make_snap(
+            0.92, "2026-10-08T02:05:00Z", 15, 96000, ts="2026-10-07T02:10:00Z"
+        ),
+    ]
+    res = usage.infer_billing(snaps, "target-model", min_pairs=3)
+    self.assertEqual(res["samples"], 3)
+    self.assertEqual(res["skipped_reset_pairs"], 1)
+    self.assertEqual(res["unit"], "calls")
+    self.assertAlmostEqual(res["fit"]["calls"]["units_per_full_quota"], 100.0)
+    self.assertAlmostEqual(res["fit"]["calls"]["cv"], 0.0)
+
   def test_reset_boundary_and_zero_drop_and_insufficient_samples(self):
     snaps = [
         self._make_snap(0.50, "T1", 1, 1000),
         self._make_snap(0.49, "T1", 2, 2000),
         # Reset boundary: reset_time changes T1 -> T2 and quota jumps to 1.0
         self._make_snap(1.00, "T2", 5, 5000),
-        # Zero quota drop despite positive usage
+        # Zero quota drop despite positive usage (accumulates into next drop)
         self._make_snap(1.00, "T2", 7, 8000),
         self._make_snap(0.99, "T2", 8, 9000),
     ]

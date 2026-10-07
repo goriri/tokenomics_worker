@@ -217,16 +217,19 @@ metadata for the current conversation and its subagent children:
   with cumulative usage across tracked conversations.
 
 Because the server does not expose a model's billing unit directly,
-`infer_billing` compares consecutive snapshot pairs (within the same
-`reset_time` window and over conversations present in both snapshots) and fits
-quota drop against calls vs tokens across each quota group:
+`infer_billing` walks snapshots in order and accumulates usage deltas (over
+conversations present in each consecutive pair) into segments until
+`remaining_fraction` drops by at least `min_drop` (default `0.002`), discarding
+open segments across quota resets (when `remaining_fraction` rises or a
+previous `reset_time` has passed), and fits segment quota drops against calls
+vs tokens across each quota group:
 
 - Call `infer_billing` to inspect fit (`units_per_full_quota` and coefficient
-  of variation `cv` for `calls`, `tokens_total`, and `tokens_uncached`) and
-  confidence (`high`, `medium`, `low`, or `insufficient`).
+  of variation `cv` for `calls`, `tokens_total`, and `tokens_uncached`),
+  `pending_usage`, and confidence (`high`, `medium`, `low`, or `insufficient`).
 - Call `infer_billing` with `apply: true` once confidence reaches `medium`
-  (>= 3 pairs, CV < 0.5) or `high` (>= 5 pairs, CV < 0.25 and > 2x separation)
-  to save `billing.inferred` into `custom_models`.
+  (>= 3 segments, CV < 0.5) or `high` (>= 5 segments, CV < 0.25 and > 2x
+  separation) to save `billing.inferred` into `custom_models`.
 - Inferred billing counts as a known unit for the pairing verdict with a
   `warn` finding (`billing for X inferred from N samples (confidence C)`), and
   never overwrites manually configured billing.

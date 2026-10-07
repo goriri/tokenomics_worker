@@ -1007,18 +1007,31 @@ def infer_billing(
     snapshots: list[dict[str, Any]],
     target: str,
     min_pairs: int = 3,
+    min_drop: float = 0.002,
 ) -> dict[str, Any]:
-  """Empirically infers billing unit ('calls' vs 'tokens') from snapshot pairs.
+  """Empirically infers billing unit ('calls' vs 'tokens') from usage snapshots.
+
+  Walks snapshots in order and accumulates usage deltas (over conversations
+  common to each consecutive pair) into an open segment until the accumulated
+  quota drop reaches at least `min_drop` (default 0.002), then emits one sample
+  `(accumulated_usage, accumulated_drop)` and starts a new segment. Trailing
+  usage with no closing drop is reported in `pending_usage`.
+
+  A quota reset is detected when `remaining_fraction` rises (> 1e-9) or when
+  the previous snapshot's `reset_time` is <= the later snapshot's `ts`. A reset
+  discards the open segment. Rolling/drifting `reset_time` values that have not
+  yet passed do not reset the segment.
 
   Confidence levels:
-    * 'insufficient': fewer than min_pairs (default 3) positive-drop pairs.
-    * 'high': >= max(5, min_pairs) pairs, best CV < 0.25, and > 2x separation
+    * 'insufficient': fewer than min_pairs (default 3) completed segments.
+    * 'high': >= max(5, min_pairs) samples, best CV < 0.25, and > 2x separation
       against the competing billing unit.
-    * 'medium': >= min_pairs pairs and best CV < 0.5.
-    * 'low': >= min_pairs pairs and best CV >= 0.5.
+    * 'medium': >= min_pairs samples and best CV < 0.5.
+    * 'low': >= min_pairs samples and best CV >= 0.5.
   """
   clean_target = (target or "").strip()
   effective_min = max(1, int(min_pairs))
+  effective_min_drop = max(1e-12, float(min_drop))
 
   pairs: list[dict[str, float]] = []
   zero_drop_samples = 0
@@ -1029,12 +1042,21 @@ def infer_billing(
   all_mids: set[str] = set()
   all_enums: set[str] = set()
 
+  seg_calls = 0
+  seg_tokens_total = 0
+  seg_tokens_uncached = 0
+  seg_drop = 0.0
+
   for s1, s2 in zip(snapshots or [], (snapshots or [])[1:]):
     if not isinstance(s1, dict) or not isinstance(s2, dict):
       continue
     qg1, rf1, rt1, mids1, enums1 = _resolve_group_in_snapshot(s1, clean_target)
     qg2, rf2, rt2, mids2, enums2 = _resolve_group_in_snapshot(s2, clean_target)
     if rf1 is None or rf2 is None:
+      seg_calls = 0
+      seg_tokens_total = 0
+      seg_tokens_uncached = 0
+      seg_drop = 0.0
       continue
     if qg2 is not None:
       resolved_qg = qg2
@@ -1044,28 +1066,24 @@ def infer_billing(
     group_enums = enums1 | enums2
     all_enums.update(group_enums)
 
-    if rt1 != rt2:
-      skipped_reset_pairs += 1
-      continue
-    if rt1 is not None:
-      rt_dt = catalog._parse_iso_utc(rt1)
-      ts1_dt = catalog._parse_iso_utc(str(s1.get("ts") or ""))
+    is_reset = False
+    if rf2 - rf1 > 1e-9:
+      is_reset = True
+    elif rt1 is not None:
+      rt1_dt = catalog._parse_iso_utc(rt1)
       ts2_dt = catalog._parse_iso_utc(str(s2.get("ts") or ""))
-      if (
-          rt_dt is not None
-          and ts1_dt is not None
-          and ts2_dt is not None
-          and ts1_dt < rt_dt <= ts2_dt
-      ):
-        skipped_reset_pairs += 1
-        continue
+      if rt1_dt is not None and ts2_dt is not None and rt1_dt <= ts2_dt:
+        is_reset = True
 
-    quota_drop = rf1 - rf2
-    if quota_drop < -1e-12:
+    if is_reset:
       skipped_reset_pairs += 1
+      seg_calls = 0
+      seg_tokens_total = 0
+      seg_tokens_uncached = 0
+      seg_drop = 0.0
       continue
-    if quota_drop < 0.0:
-      quota_drop = 0.0
+
+    step_drop = max(0.0, rf1 - rf2)
 
     delta = snapshot_delta(s1, s2)
     pm = delta["per_model"]
@@ -1082,26 +1100,45 @@ def infer_billing(
     if any(
         x < 0 for x in (d_calls, d_input, d_output, d_cache_read, d_cache_write)
     ):
+      seg_calls = 0
+      seg_tokens_total = 0
+      seg_tokens_uncached = 0
+      seg_drop = 0.0
       continue
 
     d_tokens_total = d_input + d_output + d_cache_read + d_cache_write
     d_tokens_uncached = d_input + d_output + d_cache_write
 
-    if d_calls <= 0 and d_tokens_total <= 0:
-      continue
-
-    if quota_drop <= 1e-12:
+    if (d_calls > 0 or d_tokens_total > 0) and step_drop <= 1e-12:
       zero_drop_samples += 1
       zero_drop_calls += d_calls
       zero_drop_tokens += d_tokens_total
-      continue
 
-    pairs.append({
-        "quota_drop": quota_drop,
-        "calls": float(d_calls),
-        "tokens_total": float(d_tokens_total),
-        "tokens_uncached": float(d_tokens_uncached),
-    })
+    seg_calls += d_calls
+    seg_tokens_total += d_tokens_total
+    seg_tokens_uncached += d_tokens_uncached
+
+    if seg_calls > 0 or seg_tokens_total > 0:
+      seg_drop += step_drop
+      if seg_drop >= effective_min_drop:
+        pairs.append({
+            "quota_drop": seg_drop,
+            "calls": float(seg_calls),
+            "tokens_total": float(seg_tokens_total),
+            "tokens_uncached": float(seg_tokens_uncached),
+        })
+        seg_calls = 0
+        seg_tokens_total = 0
+        seg_tokens_uncached = 0
+        seg_drop = 0.0
+    else:
+      seg_drop = 0.0
+
+  pending_usage = {
+      "calls": int(seg_calls),
+      "tokens_total": int(seg_tokens_total),
+      "tokens_uncached": int(seg_tokens_uncached),
+  }
 
   fit = {
       "calls": _compute_measure_fit(pairs, "calls"),
@@ -1120,8 +1157,8 @@ def infer_billing(
     caveats.append(
         f"Observed {zero_drop_samples} pair(s) with positive usage"
         f" ({zero_drop_calls} calls, {zero_drop_tokens} tokens) but zero"
-        " measured quota drop (quota pool may be quantized, cached, or"
-        " unmetered for those turns)."
+        " measured quota drop (accumulated into lagged segments or"
+        " pending_usage)."
     )
 
   calls_full = fit["calls"]["units_per_full_quota"]
@@ -1157,6 +1194,7 @@ def infer_billing(
         "method": None,
         "confidence": "insufficient",
         "samples": samples,
+        "pending_usage": pending_usage,
         "zero_drop_samples": zero_drop_samples,
         "skipped_reset_pairs": skipped_reset_pairs,
         "fit": fit,
@@ -1182,6 +1220,7 @@ def infer_billing(
         "method": None,
         "confidence": "insufficient",
         "samples": samples,
+        "pending_usage": pending_usage,
         "zero_drop_samples": zero_drop_samples,
         "skipped_reset_pairs": skipped_reset_pairs,
         "fit": fit,
@@ -1227,6 +1266,7 @@ def infer_billing(
       "method": best_method,
       "confidence": confidence,
       "samples": samples,
+      "pending_usage": pending_usage,
       "zero_drop_samples": zero_drop_samples,
       "skipped_reset_pairs": skipped_reset_pairs,
       "fit": fit,
