@@ -501,14 +501,12 @@ def collect_usage(
 
 def usage_cache_path(app_dir: str) -> str:
   """Returns the usage.json cache path for an app data directory."""
-  return os.path.join(app_dir, "plugin_data", tc.PLUGIN_NAME, "usage.json")
+  return os.path.join(tc.plugin_data_dir(app_dir), "usage.json")
 
 
 def snapshots_path(app_dir: str) -> str:
   """Returns the usage_snapshots.jsonl ledger path for an app data directory."""
-  return os.path.join(
-      app_dir, "plugin_data", tc.PLUGIN_NAME, "usage_snapshots.jsonl"
-  )
+  return os.path.join(tc.plugin_data_dir(app_dir), "usage_snapshots.jsonl")
 
 
 def _read_usage_file(path: str) -> dict[str, Any] | None:

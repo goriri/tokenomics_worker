@@ -251,9 +251,7 @@ def fetch_live_catalog(
 
 def catalog_cache_path(app_dir: str) -> str:
   """Returns the target cache file path for an app data directory."""
-  return os.path.join(
-      app_dir, "plugin_data", tc.PLUGIN_NAME, "model_catalog.json"
-  )
+  return os.path.join(tc.plugin_data_dir(app_dir), "model_catalog.json")
 
 
 def write_catalog(catalog: dict[str, Any], app_dir: str) -> str:

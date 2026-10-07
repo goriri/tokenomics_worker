@@ -265,6 +265,39 @@ class AppDataDirTest(unittest.TestCase):
       with self.assertRaisesRegex(tc.ConfigError, tc.APP_DIR_ENV):
         tc.app_data_dir()
 
+  def test_plugin_data_dir_follows_install_folder_name(self):
+    # The CLI prunes plugin_data/<name> folders that match no installed plugin
+    # folder, so caches must live under the install name, not the manifest name.
+    gemini = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, gemini, True)
+    app_dir = os.path.join(gemini, "some-cli")
+    plugins = os.path.join(gemini, "config", "plugins")
+    os.makedirs(plugins)
+    os.symlink(tc.PLUGIN_ROOT, os.path.join(plugins, "my_install_name"))
+    os.makedirs(os.path.join(plugins, "unrelated_plugin"))
+    self.assertEqual(
+        tc.plugin_data_dir(app_dir),
+        os.path.join(app_dir, "plugin_data", "my_install_name"),
+    )
+    self.assertEqual(
+        os.path.dirname(catalog.catalog_cache_path(app_dir)),
+        tc.plugin_data_dir(app_dir),
+    )
+    self.assertEqual(
+        os.path.dirname(usage.snapshots_path(app_dir)),
+        tc.plugin_data_dir(app_dir),
+    )
+
+  def test_plugin_data_dir_defaults_to_documented_install_name(self):
+    app_dir = os.path.join(tempfile.mkdtemp(), "some-cli")
+    self.addCleanup(shutil.rmtree, os.path.dirname(app_dir), True)
+    self.assertEqual(
+        tc.plugin_data_dir(app_dir),
+        os.path.join(
+            app_dir, "plugin_data", os.path.basename(tc.DEFAULT_PLUGIN_DIR)
+        ),
+    )
+
 
 class RegistryTest(FixtureMixin, unittest.TestCase):
 

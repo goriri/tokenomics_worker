@@ -82,6 +82,30 @@ def plugin_dir_for_prompts() -> str:
   return os.environ.get(PLUGIN_DIR_ENV) or DEFAULT_PLUGIN_DIR
 
 
+def plugin_data_dir(app_dir: str) -> str:
+  """Returns this plugin's cache folder under <app_dir>/plugin_data/.
+
+  The CLI prunes plugin_data/ folders that do not match an installed plugin's
+  folder name every time it starts, so the cache must live under the name the
+  plugin is installed as (e.g. plugins/tokenomics_worker -> plugin_data/
+  tokenomics_worker), not under the manifest name. Order: an entry in the
+  sibling config/plugins/ folder that resolves to this checkout, then the
+  basename of DEFAULT_PLUGIN_DIR.
+  """
+  base = os.path.join(app_dir, "plugin_data")
+  plugins_dir = os.path.join(
+      os.path.dirname(os.path.abspath(app_dir)), "config", "plugins"
+  )
+  try:
+    entries = sorted(os.listdir(plugins_dir))
+  except OSError:
+    entries = []
+  for entry in entries:
+    if os.path.realpath(os.path.join(plugins_dir, entry)) == PLUGIN_ROOT:
+      return os.path.join(base, entry)
+  return os.path.join(base, os.path.basename(DEFAULT_PLUGIN_DIR))
+
+
 def find_app_dir_for_conversation(conversation_id: str) -> str | None:
   """Finds the app directory under ~/.gemini holding a conversation db or brain."""
   override = os.environ.get(APP_DIR_ENV)

@@ -209,10 +209,10 @@ Every time `scripts/model_catalog.py` runs (unless `--no-usage` is passed), it
 also reads per-model call and token counters from the local server's trajectory
 metadata for the current conversation and its subagent children:
 
-- `<app data dir>/plugin_data/tokenomics-worker/usage.json` caches sanitized
+- `<app data dir>/plugin_data/tokenomics_worker/usage.json` caches sanitized
   per-conversation usage (calls, input/output/cache-read/cache-write tokens per
   model enum, plus child conversation IDs — never message text or tokens).
-- `<app data dir>/plugin_data/tokenomics-worker/usage_snapshots.jsonl` appends
+- `<app data dir>/plugin_data/tokenomics_worker/usage_snapshots.jsonl` appends
   one snapshot line pairing the catalog's high-precision `remaining_fraction`
   with cumulative usage across tracked conversations.
 
@@ -256,7 +256,7 @@ vs tokens across each quota group:
 provides `ANTIGRAVITY_LS_ADDRESS` and a per-session token for its local
 server. It asks that server for the model configs (the same data behind
 `/model`), sends the token only to localhost, and writes a token-free cache
-to `<app data dir>/plugin_data/tokenomics-worker/model_catalog.json`. The
+to `<app data dir>/plugin_data/tokenomics_worker/model_catalog.json`. The
 MCP server only reads that cache. Without those variables it falls back to
 `agy models` (ids and labels, no quota). Models that share identical quota
 numbers are grouped into an inferred quota bucket for the shared-bucket check.
